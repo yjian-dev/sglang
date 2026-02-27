@@ -132,6 +132,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        # For SDAR-style models: use causal attention during STAGING_PREFILL
+        self.dllm_causal_prefill = (
+            self.dllm_config.causal_prefill if self.dllm_config is not None else False
+        )
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -815,6 +819,18 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            # For SDAR-style dLLM models with causal_prefill=True:
+            # STAGING_PREFILL (extend_no_prefix=True) must use causal attention
+            # to match training where prompt (x0) tokens attend causally.
+            # STAGING_DECODE (extend_no_prefix=False, DLLM_EXTEND) keeps
+            # bidirectional (causal=False) for the current block.
+            if (
+                self.dllm_causal_prefill
+                and layer.attn_type == AttentionType.ENCODER_ONLY
+                and self.forward_metadata.extend_no_prefix
+            ):
+                causal = True
+
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
@@ -832,6 +848,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 if not self.is_dllm_model:
                     # TODO: design a better interface
                     # For other models, use causal attention for the ragged part as previously
+                    causal = True
+                elif (
+                    self.dllm_causal_prefill
+                    and layer.attn_type == AttentionType.ENCODER_ONLY
+                    and not forward_batch.forward_mode.is_dllm_extend()
+                ):
+                    # SDAR-style causal_prefill: multi-block STAGING_PREFILL also
+                    # needs causal attention for the ragged (new-token) part.
                     causal = True
 
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(

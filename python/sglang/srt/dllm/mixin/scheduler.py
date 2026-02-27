@@ -128,6 +128,18 @@ class SchedulerDllmMixin:
                 DllmReqPhase.INCOMING_DECODE,
             )
 
+        # Safety guard: if can_run_list contains a mix of prefill (0-mask) and
+        # decode (mask-containing) requests, keep only the prefill ones.
+        # This prevents mixed-attention-mode batches where causal-prefill
+        # requests would be processed with bidirectional attention.
+        if adder.can_run_list:
+            has_prefill = any(req.is_dllm_prefill() for req in adder.can_run_list)
+            has_decode = any(not req.is_dllm_prefill() for req in adder.can_run_list)
+            if has_prefill and has_decode:
+                adder.can_run_list = [
+                    req for req in adder.can_run_list if req.is_dllm_prefill()
+                ]
+
         return forward_mode
 
     def _process_batch_by_phase(
