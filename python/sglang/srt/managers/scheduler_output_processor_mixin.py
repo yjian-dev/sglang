@@ -374,6 +374,17 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = result.next_token_ids[idx].tolist()
             self.num_generated_tokens += len(next_token_ids)
 
+            # Sync decoded tokens back into dllm_ids so the radix cache
+            # sees the actual token values instead of stale MASK tokens.
+            if req.dllm_ids and next_token_ids:
+                block_size = req.dllm_config.block_size
+                write_start = (
+                    req.dllm_block_offset + block_size - len(next_token_ids)
+                )
+                req.dllm_ids[write_start : write_start + len(next_token_ids)] = (
+                    next_token_ids
+                )
+
             for _token_idx, next_token_id in enumerate(next_token_ids):
                 req.output_ids.append(next_token_id)
                 req.check_finished()

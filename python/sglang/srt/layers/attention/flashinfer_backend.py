@@ -99,6 +99,7 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
+    dllm_is_prefill: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -505,11 +506,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
             )
+            # For SDAR-style dLLM models with causal_prefill: detect whether
+            # this extend batch is a STAGING_PREFILL (no mask tokens in input).
+            # Multi-block prefill with a prefix enters the else branch
+            # (extend_no_prefix=False) but still needs causal attention on the
+            # ragged part.
+            dllm_is_prefill = False
+            if (
+                self.dllm_causal_prefill
+                and forward_batch.forward_mode.is_dllm_extend()
+            ):
+                dllm_is_prefill = not (
+                    forward_batch.input_ids == self.dllm_config.mask_id
+                ).any().item()
+
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
+                dllm_is_prefill=dllm_is_prefill,
             )
 
     def init_cuda_graph_state(
@@ -852,7 +868,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 elif (
                     self.dllm_causal_prefill
                     and layer.attn_type == AttentionType.ENCODER_ONLY
-                    and not forward_batch.forward_mode.is_dllm_extend()
+                    and self.forward_metadata.dllm_is_prefill
                 ):
                     # SDAR-style causal_prefill: multi-block STAGING_PREFILL also
                     # needs causal attention for the ragged (new-token) part.
