@@ -248,6 +248,9 @@ lmms-eval
 **/.serena/
 ctags/
 outputs/
+output/
+output_*/
+test_gsm8k_0shot.py
 
 # Eval Cache
 .longbench_cache/

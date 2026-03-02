@@ -638,12 +638,25 @@ class CudaGraphRunner:
             else True
         )
 
+        # For dLLM with causal prefill (e.g. DreamShift models), STAGING_PREFILL
+        # requires causal attention while the CUDA graph is captured with
+        # bidirectional (DLLM_EXTEND) attention. Skip CUDA graph for STAGING_PREFILL
+        # passes (detected by absence of mask tokens in input_ids).
+        is_dllm_decode = (
+            not (
+                self.is_dllm
+                and self.dllm_config.causal_prefill
+                and not (forward_batch.input_ids == self.dllm_config.mask_id).any()
+            )
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dllm_decode
         )
 
     def _init_profile_context_and_memory_record(self):
