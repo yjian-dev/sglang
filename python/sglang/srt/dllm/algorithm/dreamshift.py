@@ -102,6 +102,9 @@ class DreamShift(DllmAlgorithm):
         self.temperature: float = config.algorithm_config.get("temperature", 1.0)
         self.top_k: int = config.algorithm_config.get("top_k", 0)
         self.top_p: float = config.algorithm_config.get("top_p", 1.0)
+        self.remasking_strategy: str = config.algorithm_config.get(
+            "remasking_strategy", "low_confidence_dynamic"
+        )
         self._schedule = get_num_transfer_tokens(self.block_size, self.denoising_steps)
         self.apply_logit_shift: bool = config.causal_prefill
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
@@ -210,7 +213,7 @@ class DreamShift(DllmAlgorithm):
                     top_p=self.top_p,
                 )
 
-                # low_confidence_dynamic selection
+                # Token transfer selection
                 confidence = torch.where(
                     block_mask_index, x0_p, torch.tensor(-np.inf, device=device)
                 )
@@ -223,15 +226,25 @@ class DreamShift(DllmAlgorithm):
 
                 if n_high >= num_to_transfer:
                     transfer_index = high_conf_mask
+                elif self.remasking_strategy == "low_confidence_causal":
+                    # Fallback to leftmost mask (preserves causal/left-to-right order)
+                    transfer_index = torch.zeros_like(block_mask_index)
+                    first_mask = block_mask_index.nonzero(as_tuple=True)[0][0].item()
+                    transfer_index[first_mask] = True
                 else:
+                    # low_confidence_dynamic: fallback to topk by confidence
                     transfer_index = torch.zeros_like(block_mask_index)
                     _, idx = torch.topk(confidence, num_to_transfer)
                     transfer_index[idx] = True
 
                 block_input_ids[transfer_index] = x0[transfer_index]
 
-        # Commit pass: final forward to store KV and capture prev_last_logits
+        # Commit pass: final forward to store KV and capture prev_last_logits.
+        # Signal the attention backend to use bidirectional (not causal) for the
+        # ragged part, matching reference generate.py's causal_commit=False.
+        forward_batch.dllm_is_commit = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        forward_batch.dllm_is_commit = False
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
         if self.apply_logit_shift:

@@ -508,17 +508,22 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             # For SDAR-style dLLM models with causal_prefill: detect whether
             # this extend batch is a STAGING_PREFILL (no mask tokens in input).
-            # Multi-block prefill with a prefix enters the else branch
-            # (extend_no_prefix=False) but still needs causal attention on the
-            # ragged part.
+            # Multi-block prefill with a prefix enters the cascade branch
+            # (extend_no_prefix=False) and needs causal attention.
+            # The commit pass (after denoising, also no mask tokens) signals
+            # dllm_is_commit=True to force bidirectional attention.
             dllm_is_prefill = False
             if (
                 self.dllm_causal_prefill
                 and forward_batch.forward_mode.is_dllm_extend()
             ):
-                dllm_is_prefill = not (
-                    forward_batch.input_ids == self.dllm_config.mask_id
-                ).any().item()
+                is_commit = getattr(forward_batch, "dllm_is_commit", False)
+                if is_commit:
+                    dllm_is_prefill = False  # commit → bidirectional
+                else:
+                    dllm_is_prefill = not (
+                        forward_batch.input_ids == self.dllm_config.mask_id
+                    ).any().item()
 
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -870,8 +875,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     and layer.attn_type == AttentionType.ENCODER_ONLY
                     and self.forward_metadata.dllm_is_prefill
                 ):
-                    # SDAR-style causal_prefill: multi-block STAGING_PREFILL also
+                    # SDAR-style causal_prefill: multi-block STAGING_PREFILL
                     # needs causal attention for the ragged (new-token) part.
+                    # Commit passes are signaled by injecting a mask token,
+                    # so dllm_is_prefill=False and this branch is skipped.
                     causal = True
 
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(

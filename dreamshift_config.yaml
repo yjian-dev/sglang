@@ -4,3 +4,4 @@ block_size: 4
 temperature: 1.0
 top_k: 50
 top_p: 0.95
+remasking_strategy: low_confidence_causal
