@@ -1,0 +1,5 @@
+# DreamShiftCausal config for block_size=1 SDAR models
+# (block_size is auto-detected from model config)
+temperature: 1.0
+top_k: 50
+top_p: 0.95

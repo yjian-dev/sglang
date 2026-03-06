@@ -50,6 +50,12 @@ class DllmConfig:
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
+        # Prefer block_size from model config if available (e.g. block_size=1
+        # models vs the default block_size=4 in DLLM_PARAMS).
+        hf_block_size = getattr(model_config.hf_config, "block_size", None)
+        if hf_block_size is not None:
+            block_size = hf_block_size
+
         # SDAR models with use_regular_causal=True were trained with causal
         # attention for prompt (x0) tokens; prefill must use causal attention.
         causal_prefill = getattr(model_config.hf_config, "use_regular_causal", False)

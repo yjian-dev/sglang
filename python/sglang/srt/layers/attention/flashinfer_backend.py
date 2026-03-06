@@ -100,6 +100,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     dllm_is_prefill: bool = False
+    dllm_force_causal: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -525,12 +526,17 @@ class FlashInferAttnBackend(AttentionBackend):
                         forward_batch.input_ids == self.dllm_config.mask_id
                     ).any().item()
 
+            dllm_force_causal = getattr(
+                forward_batch, "dllm_force_causal", False
+            )
+
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
                 dllm_is_prefill=dllm_is_prefill,
+                dllm_force_causal=dllm_force_causal,
             )
 
     def init_cuda_graph_state(
@@ -879,6 +885,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     # needs causal attention for the ragged (new-token) part.
                     # Commit passes are signaled by injecting a mask token,
                     # so dllm_is_prefill=False and this branch is skipped.
+                    causal = True
+                elif self.forward_metadata.dllm_force_causal:
+                    # DreamShiftBlock2: force causal within block so that
+                    # token_0 does not attend to MASK at position 1.
                     causal = True
 
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
