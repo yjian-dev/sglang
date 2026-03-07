@@ -365,14 +365,75 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Read algorithm signals for KV trim / dllm_ids override
+        dllm_algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        dllm_write_override = (
+            getattr(dllm_algo, "_dllm_write_override", {}) if dllm_algo else {}
+        )
+        kv_trim_info = (
+            getattr(dllm_algo, "_kv_trim_info", {}) if dllm_algo else {}
+        )
+        advance_override = (
+            getattr(dllm_algo, "_advance_override", {}) if dllm_algo else {}
+        )
+
+        if not result.next_token_ids:
+            # Prefilling stage: no new tokens but KV was computed.
+            # Update prefix_indices for all requests so the next round
+            # sees the correct prefix length.
+            for req in batch.reqs:
+                self.tree_cache.cache_unfinished_req(req)
+
         for idx in range(batch.batch_size()):
-            # If no new tokens generated, meaning the prefilling stage
             if not result.next_token_ids:
                 break
 
             req = batch.reqs[idx]
             next_token_ids = result.next_token_ids[idx].tolist()
             self.num_generated_tokens += len(next_token_ids)
+
+            # Sync decoded tokens back into dllm_ids.
+            # Use override if the algorithm provided separate dllm tokens.
+            req_pool_idx = req.req_pool_idx
+            dllm_tokens = dllm_write_override.pop(req_pool_idx, None)
+            if req.dllm_ids:
+                if dllm_tokens is not None:
+                    # Override: write full block from algorithm
+                    write_start = req.dllm_block_offset
+                    req.dllm_ids[
+                        write_start : write_start + len(dllm_tokens)
+                    ] = dllm_tokens
+                elif next_token_ids:
+                    block_size = req.dllm_config.block_size
+                    write_start = (
+                        req.dllm_block_offset
+                        + block_size
+                        - len(next_token_ids)
+                    )
+                    req.dllm_ids[
+                        write_start : write_start + len(next_token_ids)
+                    ] = next_token_ids
+
+            # Handle KV trim: free dirty KV slots, adjust accounting
+            trim_info = kv_trim_info.pop(req_pool_idx, None)
+            if trim_info is not None:
+                kv_indices_to_free = torch.tensor(
+                    trim_info["kv_indices"],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                )
+                self.token_to_kv_pool_allocator.free(kv_indices_to_free)
+                trim_count = trim_info["trim_count"]
+                req.kv_committed_len -= trim_count
+                req.kv_allocated_len -= trim_count
+                req.dllm_kv_valid_len = req.kv_committed_len
+            else:
+                req.dllm_kv_valid_len = None
+
+            # Set variable advance for next _init_fill_ids_for_dllm
+            adv = advance_override.pop(req_pool_idx, None)
+            if adv is not None:
+                req.dllm_next_advance = adv
 
             for _token_idx, next_token_id in enumerate(next_token_ids):
                 req.output_ids.append(next_token_id)

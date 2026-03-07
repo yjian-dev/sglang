@@ -569,9 +569,14 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        # Truncate input length to available tokens and update request metadata
-        truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+        # Truncate input length to available tokens and cap to block_size so each
+        # round processes exactly one block. Without this cap, extend_input_len
+        # could exceed block_size (e.g. when the _get_dllm_remain_tokens fallback
+        # returns rem_dllm_tokens > block_size), causing a positions/input_ids
+        # size mismatch since positions are always generated for exactly block_size.
+        max_extend = min(req.extend_input_len, _rem_tokens, self.dllm_block_size)
+        truncated = req.extend_input_len > max_extend
+        req.extend_input_len = max_extend
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
 
@@ -779,10 +784,7 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
-
+                # Ignore truncation_align_size for dllm prefill (block_size alignment is used instead)
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:

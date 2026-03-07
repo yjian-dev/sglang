@@ -70,6 +70,7 @@ from sglang.srt.configs import (
     Step3p5Config,
     Step3VLConfig,
 )
+from sglang.srt.configs.sdar import SDARConfig
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -104,6 +105,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
+    SDARConfig,
     Step3p5Config,
 ]
 

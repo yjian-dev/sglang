@@ -28,6 +28,7 @@ from sglang.srt.configs.step3_vl import (
     Step3VisionEncoderConfig,
     Step3VLConfig,
 )
+from sglang.srt.configs.sdar import SDARConfig
 from sglang.srt.configs.step3p5 import Step3p5Config
 
 __all__ = [
@@ -60,5 +61,6 @@ __all__ = [
     "NemotronH_Nano_VL_V2_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
+    "SDARConfig",
     "Step3p5Config",
 ]
