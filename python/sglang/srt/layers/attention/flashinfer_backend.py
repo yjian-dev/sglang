@@ -99,6 +99,8 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
+    dllm_is_prefill: bool = False
+    dllm_force_causal: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -132,6 +134,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        # For SDAR-style models: use causal attention during STAGING_PREFILL
+        self.dllm_causal_prefill = (
+            self.dllm_config.causal_prefill if self.dllm_config is not None else False
+        )
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -501,11 +507,36 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
             )
+            # For SDAR-style dLLM models with causal_prefill: detect whether
+            # this extend batch is a STAGING_PREFILL (no mask tokens in input).
+            # Multi-block prefill with a prefix enters the cascade branch
+            # (extend_no_prefix=False) and needs causal attention.
+            # The commit pass (after denoising, also no mask tokens) signals
+            # dllm_is_commit=True to force bidirectional attention.
+            dllm_is_prefill = False
+            if (
+                self.dllm_causal_prefill
+                and forward_batch.forward_mode.is_dllm_extend()
+            ):
+                is_commit = getattr(forward_batch, "dllm_is_commit", False)
+                if is_commit:
+                    dllm_is_prefill = False  # commit → bidirectional
+                else:
+                    dllm_is_prefill = not (
+                        forward_batch.input_ids == self.dllm_config.mask_id
+                    ).any().item()
+
+            dllm_force_causal = getattr(
+                forward_batch, "dllm_force_causal", False
+            )
+
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
+                dllm_is_prefill=dllm_is_prefill,
+                dllm_force_causal=dllm_force_causal,
             )
 
     def init_cuda_graph_state(
@@ -815,6 +846,18 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            # For SDAR-style dLLM models with causal_prefill=True:
+            # STAGING_PREFILL (extend_no_prefix=True) must use causal attention
+            # to match training where prompt (x0) tokens attend causally.
+            # STAGING_DECODE (extend_no_prefix=False, DLLM_EXTEND) keeps
+            # bidirectional (causal=False) for the current block.
+            if (
+                self.dllm_causal_prefill
+                and layer.attn_type == AttentionType.ENCODER_ONLY
+                and self.forward_metadata.extend_no_prefix
+            ):
+                causal = True
+
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
@@ -832,6 +875,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 if not self.is_dllm_model:
                     # TODO: design a better interface
                     # For other models, use causal attention for the ragged part as previously
+                    causal = True
+                elif (
+                    self.dllm_causal_prefill
+                    and layer.attn_type == AttentionType.ENCODER_ONLY
+                    and self.forward_metadata.dllm_is_prefill
+                ):
+                    # SDAR-style causal_prefill: multi-block STAGING_PREFILL
+                    # needs causal attention for the ragged (new-token) part.
+                    # Commit passes are signaled by injecting a mask token,
+                    # so dllm_is_prefill=False and this branch is skipped.
+                    causal = True
+                elif self.forward_metadata.dllm_force_causal:
+                    # DreamShiftBlock2: force causal within block so that
+                    # token_0 does not attend to MASK at position 1.
                     causal = True
 
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
