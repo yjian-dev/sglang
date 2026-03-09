@@ -339,7 +339,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             rpx = req_pool_indices_cpu[bid]
             sl = int(seq_lens_cpu[bid])
             if rpx in spec_rejected:
-                tc = 1  # spec reject: trim MASK only (keep carry KV)
+                tc = 1  # spec reject: trim MASK only (TODO: trim=2 causes KV bug)
             elif case_codes[bid] <= 1:
                 tc = 1  # A/B: trim MASK only
             else:
@@ -368,17 +368,15 @@ class DreamShiftBlock2(DllmAlgorithm):
 
             # Spec verification may override Case A accept
             if rpx in spec_rejected:
-                # Spec rejected: output corrected t1, keep pending+carry KV,
-                # only trim MASK. The carry KV is stale but this avoids KV
-                # corruption; the corrected carry will get clean KV as pending
-                # in the next round if accepted again.
+                # Spec rejected: trim carry+MASK for clean KV.
+                # corrected_carry gets clean KV as t_prev in next round.
                 output_tokens = [t1]
                 dllm_tokens = [t0, t1, self.mask_id]
                 self._prev_last_logits[rpx] = full_logits[bid * blk + 0]
                 self._pending_draft_probs.pop(rpx, None)
                 self._stats["reject_count"] += 1
-                advance = 2
-                trim_count = 1  # only trim MASK, keep carry KV
+                advance = 2  # pending + corrected_carry committed
+                trim_count = 1  # trim MASK only (TODO: trim=2 for clean KV)
             elif cc <= 1:  # A or B (normal path)
                 if accepted:
                     output_tokens = [t1, t_diff]
