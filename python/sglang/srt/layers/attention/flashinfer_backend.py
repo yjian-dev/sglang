@@ -471,6 +471,35 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
             )
+        elif (
+            forward_batch.forward_mode.is_dllm_extend()
+            and self.is_dllm_model
+            and (forward_batch.input_ids == self.dllm_config.mask_id).any().item()
+        ):
+            # DLLM decode (has MASK): paged-only attention.
+            # Pure prefill (no MASK) falls through to general extend path
+            # which uses ragged-only (faster, no page table lookup).
+            dllm_force_causal = getattr(
+                forward_batch, "dllm_force_causal", False
+            )
+            prefix_lens = forward_batch.extend_prefix_lens
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens=prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=None,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
+                False,
+                False,
+                dllm_force_causal=dllm_force_causal,
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -702,12 +731,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
+                use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -764,9 +793,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=seq_lens[:bs] - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=True,
+                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )

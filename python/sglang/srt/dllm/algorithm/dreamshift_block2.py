@@ -29,34 +29,57 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 logger = logging.getLogger(__name__)
 
 
-def _sample(
+try:
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs as _fi_sample
+    _HAS_FLASHINFER_SAMPLING = True
+except ImportError:
+    _HAS_FLASHINFER_SAMPLING = False
+
+
+def _batched_sample(
     logits: torch.Tensor,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
-) -> Tuple[int, float]:
-    """Sample a single token from 1-D logits. Returns (token_id, prob)."""
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched sampling from [N, vocab_size] logits on GPU.
+
+    Returns (token_ids [N], probs [N]) — both stay on GPU, no .item() sync.
+    Uses flashinfer fused kernel when available (single kernel for topk+topp+sample).
+    """
     if temperature <= 0:
         probs = F.softmax(logits, dim=-1)
-        tok = probs.argmax().item()
-        return tok, probs[tok].item()
+        token_ids = probs.argmax(dim=-1)
+        token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        return token_ids, token_probs
 
-    filtered = logits.clone()
+    scaled = logits if temperature == 1.0 else logits / temperature
+    probs = F.softmax(scaled, dim=-1)
+
+    if _HAS_FLASHINFER_SAMPLING:
+        n = probs.shape[0]
+        top_ks = torch.full((n,), top_k, dtype=torch.int32, device=probs.device)
+        top_ps = torch.full((n,), top_p, dtype=torch.float32, device=probs.device)
+        token_ids = _fi_sample(
+            probs.contiguous(), top_ks, top_ps, filter_apply_order="joint"
+        )
+        token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        return token_ids, token_probs
+
+    # Fallback: manual implementation
     if top_k > 0:
-        topk_vals = filtered.topk(top_k).values
-        filtered[filtered < topk_vals[-1]] = -float("inf")
+        topk_vals, _ = scaled.topk(top_k, dim=-1)
+        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
     if top_p < 1.0:
-        sorted_logits, sorted_idx = filtered.sort(descending=True)
-        cumsum = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-        mask = cumsum - sorted_logits.softmax(dim=-1) >= top_p
-        sorted_logits[mask] = -float("inf")
-        filtered = sorted_logits.scatter(0, sorted_idx, sorted_logits)
-    if temperature != 1.0:
-        filtered = filtered / temperature
-
-    probs = F.softmax(filtered, dim=-1)
-    tok = torch.multinomial(probs, num_samples=1).item()
-    return tok, probs[tok].item()
+        sorted_logits, sorted_idx = scaled.sort(dim=-1, descending=True)
+        cum_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        mask = (cum_probs - sorted_logits.softmax(dim=-1)) >= top_p
+        sorted_logits[mask] = float("-inf")
+        scaled = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+    probs = F.softmax(scaled, dim=-1)
+    token_ids = torch.multinomial(probs, num_samples=1).squeeze(1)
+    token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+    return token_ids, token_probs
 
 
 class DreamShiftBlock2(DllmAlgorithm):
@@ -90,10 +113,16 @@ class DreamShiftBlock2(DllmAlgorithm):
             "confidence_threshold", 0.99
         )
 
+        self.use_spec_verify: bool = config.algorithm_config.get(
+            "use_spec_verify", False
+        )
+
         # Per-request state (keyed by req_pool_idx)
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
         self._carry: Dict[int, int] = {}
         self._pending: Dict[int, int] = {}
+        # Spec verification: draft distribution q(x) for the accepted t_carry
+        self._pending_draft_probs: Dict[int, torch.Tensor] = {}
 
         # Per-round signals to the output processor (read + cleared each round)
         self._dllm_write_override: Dict[int, List[int]] = {}
@@ -115,10 +144,25 @@ class DreamShiftBlock2(DllmAlgorithm):
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
 
-        has_mask = (forward_batch.input_ids == self.mask_id).any().item()
+        # Determine per-request: prefill (no MASK) vs decode (has MASK)
+        # Support mixed batches where some requests are prefill and others decode.
+        extend_lens = forward_batch.extend_seq_lens  # tokens per request
+        req_pool_indices_cpu = forward_batch.req_pool_indices[:batch_size].tolist()
 
-        # ── Prefill (no MASK tokens) ──────────────────────────────────
-        if not has_mask:
+        # Check per-request MASK presence
+        is_decode = []  # bool per bid
+        offset = 0
+        for bid in range(batch_size):
+            n_tokens = int(extend_lens[bid]) if extend_lens is not None else int(forward_batch.seq_lens[bid].item())
+            chunk = forward_batch.input_ids[offset:offset + n_tokens]
+            is_decode.append((chunk == self.mask_id).any().item())
+            offset += n_tokens
+
+        has_any_decode = any(is_decode)
+        has_any_prefill = not all(is_decode)
+
+        # ── Pure prefill (no decode requests) ──────────────────────────
+        if not has_any_decode:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             full_logits = out.logits_output.full_logits
 
@@ -130,7 +174,7 @@ class DreamShiftBlock2(DllmAlgorithm):
                     int(prefix_lens[bid].item()) if prefix_lens is not None else 0
                 )
                 n_new = seq_len - prefix_len
-                req_pool_idx = int(forward_batch.req_pool_indices[bid].item())
+                req_pool_idx = req_pool_indices_cpu[bid]
                 last_idx = offset + n_new - 1
                 self._prev_last_logits[req_pool_idx] = (
                     full_logits[last_idx].detach().clone()
@@ -141,154 +185,257 @@ class DreamShiftBlock2(DllmAlgorithm):
             return out.logits_output, [], out.can_run_graph
 
         # ── Decode ─────────────────────────────────────────────────────
-        bs = self.block_size
+        blk = self.block_size
         self._dllm_write_override.clear()
         self._kv_trim_info.clear()
         self._advance_override.clear()
 
-        # Phase 1: Determine case and fill positions
-        next_token_ids_list = []
-        case_types = []
+        # Build decode-only bid list (skip prefill requests in Phase 1/3)
+        decode_bids = [bid for bid in range(batch_size) if is_decode[bid]]
+        prefill_bids = [bid for bid in range(batch_size) if not is_decode[bid]]
+
+        # Phase 1: Vectorized case determination + input_ids fill
+        # Classify each request: case_code 0=A, 1=B, 2=C
+        case_codes = []       # int per bid
+        tok0s = []            # tok_0 per bid (int)
+        tok1s = []            # tok_1 per bid (int or None)
+        pre_sample_logits = []
+        pre_sample_bids = []
+        pre_sample_cases = []  # 1=B, 2=C
 
         for bid in range(batch_size):
-            req_pool_idx = int(forward_batch.req_pool_indices[bid].item())
-            base = bid * bs
+            rpx = req_pool_indices_cpu[bid]
+            pending = self._pending.pop(rpx, None)
+            carry = self._carry.pop(rpx, None)
 
-            has_pending = req_pool_idx in self._pending
-            has_carry = req_pool_idx in self._carry
-
-            if has_pending and has_carry:
-                # Case A: [pending, carry, MASK]
-                pending = self._pending.pop(req_pool_idx)
-                carry = self._carry.pop(req_pool_idx)
-                forward_batch.input_ids[base + 0] = pending
-                forward_batch.input_ids[base + 1] = carry
-                case_types.append(("A", pending, carry))
-
-            elif has_pending:
-                # Case B: [pending, fresh, MASK]
-                pending = self._pending.pop(req_pool_idx)
-                self._carry.pop(req_pool_idx, None)
-                prev_logits = self._prev_last_logits.get(req_pool_idx)
-                fresh = self.mask_id
-                if prev_logits is not None:
-                    fresh, _ = _sample(
-                        prev_logits, self.temperature, self.top_k, self.top_p
-                    )
-                forward_batch.input_ids[base + 0] = pending
-                forward_batch.input_ids[base + 1] = fresh
-                case_types.append(("B", pending, fresh))
-
+            if pending is not None and carry is not None:
+                # Case A
+                forward_batch.input_ids[bid * blk] = pending
+                forward_batch.input_ids[bid * blk + 1] = carry
+                case_codes.append(0)
+                tok0s.append(pending)
+                tok1s.append(carry)
+            elif pending is not None:
+                # Case B — need to sample fresh
+                forward_batch.input_ids[bid * blk] = pending
+                prev = self._prev_last_logits.get(rpx)
+                if prev is not None:
+                    pre_sample_logits.append(prev)
+                    pre_sample_bids.append(bid)
+                    pre_sample_cases.append(1)
+                    tok1s.append(None)  # filled after sampling
+                else:
+                    forward_batch.input_ids[bid * blk + 1] = self.mask_id
+                    tok1s.append(self.mask_id)
+                case_codes.append(1)
+                tok0s.append(pending)
             else:
-                # Case C: [t_0, MASK, MASK]
-                self._carry.pop(req_pool_idx, None)
-                prev_logits = self._prev_last_logits.get(req_pool_idx)
-                t_0 = self.mask_id
-                if prev_logits is not None:
-                    t_0, _ = _sample(
-                        prev_logits, self.temperature, self.top_k, self.top_p
-                    )
-                forward_batch.input_ids[base + 0] = t_0
-                case_types.append(("C", t_0, None))
+                # Case C — need to sample t_0
+                prev = self._prev_last_logits.get(rpx)
+                if prev is not None:
+                    pre_sample_logits.append(prev)
+                    pre_sample_bids.append(bid)
+                    pre_sample_cases.append(2)
+                    tok0s.append(None)  # filled after sampling
+                else:
+                    forward_batch.input_ids[bid * blk] = self.mask_id
+                    tok0s.append(self.mask_id)
+                case_codes.append(2)
+                tok1s.append(None)
 
-        # Phase 2: Single forward with causal attention within block
+        # Batched pre-forward sampling (single kernel + single sync)
+        if pre_sample_logits:
+            sampled, _ = _batched_sample(
+                torch.stack(pre_sample_logits),
+                self.temperature, self.top_k, self.top_p,
+            )
+            sampled_cpu = sampled.tolist()
+            for i, bid in enumerate(pre_sample_bids):
+                tok = sampled_cpu[i]
+                if pre_sample_cases[i] == 1:  # B
+                    forward_batch.input_ids[bid * blk + 1] = tok
+                    tok1s[bid] = tok
+                else:  # C
+                    forward_batch.input_ids[bid * blk] = tok
+                    tok0s[bid] = tok
+
+        # Phase 2: Single forward
         forward_batch.dllm_force_causal = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         forward_batch.dllm_force_causal = False
         logits_output = out.logits_output
         full_logits = logits_output.full_logits
 
-        # Phase 3: Sample tokens, accept/reject, manage KV trim
+        # Phase 3: Vectorized post-forward
+
+        # Build diff/carry index tensors (no Python loop — use tensor arithmetic)
+        case_arr = torch.tensor(case_codes, dtype=torch.long, device=device)
+        bases = torch.arange(batch_size, device=device) * blk
+        # Case A/B: diff@base+1, carry@base+2;  Case C: diff@base+0, carry@base+1
+        is_ab = (case_arr <= 1)
+        diff_idx = torch.where(is_ab, bases + 1, bases)
+        carry_idx = torch.where(is_ab, bases + 2, bases + 1)
+
+        diff_logits = full_logits[diff_idx]
+        carry_logits = full_logits[carry_idx]
+
+        diff_ids, _ = _batched_sample(
+            diff_logits, self.temperature, self.top_k, self.top_p
+        )
+        carry_ids, carry_probs = _batched_sample(
+            carry_logits, self.temperature, self.top_k, self.top_p
+        )
+
+        # Single sync: all sampled data + seq_lens + KV indices to CPU
+        diff_ids_cpu = diff_ids.tolist()
+        carry_ids_cpu = carry_ids.tolist()
+        carry_probs_cpu = carry_probs.tolist()
+        seq_lens_cpu = forward_batch.seq_lens[:batch_size].tolist()
+
+        # Spec verification for Case A (before trim, since it may change trim count)
+        spec_rejected = set()
+        if self.use_spec_verify:
+            for bid in range(batch_size):
+                cc = case_codes[bid]
+                if cc != 0:  # Only Case A has both pending + carry to verify
+                    continue
+                rpx = req_pool_indices_cpu[bid]
+                draft_probs = self._pending_draft_probs.pop(rpx, None)
+                if draft_probs is None:
+                    continue
+                t1 = tok1s[bid]  # the carried token to verify
+                # Clean distribution from position 0 (pending's hidden)
+                base = bid * blk
+                clean_logits_raw = full_logits[base + 0]
+                if self.temperature > 0 and self.temperature != 1.0:
+                    clean_logits_raw = clean_logits_raw / self.temperature
+                clean_probs = F.softmax(clean_logits_raw, dim=-1)
+                p_x = clean_probs[t1].item()
+                q_x = draft_probs[t1].item()
+                r = p_x / q_x if q_x > 0 else 0.0
+                if r >= 1.0 or torch.rand(1, device=device).item() < r:
+                    continue  # accept verified
+                # REJECT: resample from corrected distribution max(0, p-q)
+                corrected = torch.clamp(clean_probs - draft_probs, min=0)
+                csum = corrected.sum()
+                if csum > 0:
+                    corrected = corrected / csum
+                    new_carry = torch.multinomial(corrected, num_samples=1).item()
+                else:
+                    new_carry = torch.multinomial(clean_probs, num_samples=1).item()
+                tok1s[bid] = new_carry
+                # Clear carry state — this bid is now a reject
+                spec_rejected.add(rpx)
+
+        # Batch KV index lookup (after spec verify, which may change trim counts)
         req_to_token = model_runner.req_to_token_pool.req_to_token
-        token_to_kv_pool = forward_batch.token_to_kv_pool
-        num_layers = model_runner.model_config.num_hidden_layers
+        trim_req_indices = []
+        trim_positions = []
+        trim_counts_per_bid = []
+        for bid in range(batch_size):
+            rpx = req_pool_indices_cpu[bid]
+            sl = int(seq_lens_cpu[bid])
+            if rpx in spec_rejected:
+                tc = 2  # spec reject: trim carry + MASK
+            elif case_codes[bid] <= 1:
+                tc = 1  # A/B: trim MASK only
+            else:
+                tc = 2  # C: trim 2 MASKs
+            trim_counts_per_bid.append(tc)
+            for t in range(tc):
+                trim_req_indices.append(rpx)
+                trim_positions.append(sl - 1 - t)
+        if trim_req_indices:
+            kv_indices_all = req_to_token[trim_req_indices, trim_positions].tolist()
+        else:
+            kv_indices_all = []
+
+        # Process accept/reject
+        next_token_ids_list = []
+        trim_offset = 0
 
         for bid in range(batch_size):
-            req_pool_idx = int(forward_batch.req_pool_indices[bid].item())
-            seq_len = int(forward_batch.seq_lens[bid].item())
-            base = bid * bs
-            case, tok_0, tok_1 = case_types[bid]
+            rpx = req_pool_indices_cpu[bid]
+            t_diff = diff_ids_cpu[bid]
+            t_carry = carry_ids_cpu[bid]
+            accepted = carry_probs_cpu[bid] >= self.confidence_threshold
+            cc = case_codes[bid]
+            t0 = tok0s[bid]
+            t1 = tok1s[bid]
 
-            if case in ("A", "B"):
-                logits_1 = full_logits[base + 1]
-                logits_2 = full_logits[base + 2]
-
-                t_diff, _ = _sample(
-                    logits_1, self.temperature, self.top_k, self.top_p
-                )
-                t_carry, t_carry_prob = _sample(
-                    logits_2, self.temperature, self.top_k, self.top_p
-                )
-
-                if t_carry_prob >= self.confidence_threshold:
-                    output_tokens = [tok_1, t_diff]
-                    dllm_tokens = [tok_0, tok_1, t_diff]
-                    trim_count = 1
-                    advance = 2
-                    self._pending[req_pool_idx] = t_diff
-                    self._carry[req_pool_idx] = t_carry
-                    self._prev_last_logits[req_pool_idx] = logits_2.detach().clone()
+            # Spec verification may override Case A accept
+            if rpx in spec_rejected:
+                # Spec rejected: output corrected t1 only, trim carry+MASK (2 slots)
+                output_tokens = [t1]
+                dllm_tokens = [t0, t1, self.mask_id]
+                self._prev_last_logits[rpx] = full_logits[bid * blk + 0]
+                self._pending_draft_probs.pop(rpx, None)
+                self._stats["reject_count"] += 1
+                advance = 2  # pending(t0) + corrected(t1) committed
+                trim_count = 2  # trim carry + MASK KV slots
+            elif cc <= 1:  # A or B (normal path)
+                if accepted:
+                    output_tokens = [t1, t_diff]
+                    dllm_tokens = [t0, t1, t_diff]
+                    self._pending[rpx] = t_diff
+                    self._carry[rpx] = t_carry
+                    self._prev_last_logits[rpx] = carry_logits[bid]
+                    # Store draft probs for spec verification in next round
+                    if self.use_spec_verify:
+                        carry_logits_raw = carry_logits[bid]
+                        if self.temperature > 0 and self.temperature != 1.0:
+                            carry_logits_raw = carry_logits_raw / self.temperature
+                        self._pending_draft_probs[rpx] = F.softmax(
+                            carry_logits_raw, dim=-1
+                        )
                     self._stats["accept_count"] += 1
                 else:
-                    output_tokens = [tok_1]
-                    dllm_tokens = [tok_0, tok_1, self.mask_id]
-                    trim_count = 1
-                    advance = 2
-                    self._pending.pop(req_pool_idx, None)
-                    self._prev_last_logits[req_pool_idx] = logits_1.detach().clone()
+                    output_tokens = [t1]
+                    dllm_tokens = [t0, t1, self.mask_id]
+                    self._prev_last_logits[rpx] = diff_logits[bid]
+                    self._pending_draft_probs.pop(rpx, None)
                     self._stats["reject_count"] += 1
-
-            else:  # Case C
-                logits_0 = full_logits[base + 0]
-                logits_1 = full_logits[base + 1]
-
-                t_diff, _ = _sample(
-                    logits_0, self.temperature, self.top_k, self.top_p
-                )
-                t_carry, t_carry_prob = _sample(
-                    logits_1, self.temperature, self.top_k, self.top_p
-                )
-
-                if t_carry_prob >= self.confidence_threshold:
-                    output_tokens = [tok_0, t_diff]
-                    dllm_tokens = [tok_0, t_diff, self.mask_id]
-                    trim_count = 2
-                    advance = 1
-                    self._pending[req_pool_idx] = t_diff
-                    self._carry[req_pool_idx] = t_carry
-                    self._prev_last_logits[req_pool_idx] = logits_1.detach().clone()
+                advance = 2
+                trim_count = 1
+            else:  # C
+                if accepted:
+                    output_tokens = [t0, t_diff]
+                    dllm_tokens = [t0, t_diff, self.mask_id]
+                    self._pending[rpx] = t_diff
+                    self._carry[rpx] = t_carry
+                    self._prev_last_logits[rpx] = carry_logits[bid]
+                    if self.use_spec_verify:
+                        carry_logits_raw = carry_logits[bid]
+                        if self.temperature > 0 and self.temperature != 1.0:
+                            carry_logits_raw = carry_logits_raw / self.temperature
+                        self._pending_draft_probs[rpx] = F.softmax(
+                            carry_logits_raw, dim=-1
+                        )
                     self._stats["accept_count"] += 1
                 else:
-                    output_tokens = [tok_0]
-                    dllm_tokens = [tok_0, self.mask_id, self.mask_id]
-                    trim_count = 2
-                    advance = 1
-                    self._pending.pop(req_pool_idx, None)
-                    self._prev_last_logits[req_pool_idx] = logits_0.detach().clone()
+                    output_tokens = [t0]
+                    dllm_tokens = [t0, self.mask_id, self.mask_id]
+                    self._prev_last_logits[rpx] = diff_logits[bid]
+                    self._pending_draft_probs.pop(rpx, None)
                     self._stats["reject_count"] += 1
+                advance = 1
+                trim_count = 2
 
             next_token_ids_list.append(
                 torch.tensor(output_tokens, device=device)
             )
-            self._dllm_write_override[req_pool_idx] = dllm_tokens
-            self._advance_override[req_pool_idx] = advance
+            self._dllm_write_override[rpx] = dllm_tokens
+            self._advance_override[rpx] = advance
 
-            # Collect and zero KV at MASK positions
-            kv_indices_to_free = []
-            for t in range(trim_count):
-                pos = seq_len - 1 - t
-                kv_idx = int(req_to_token[req_pool_idx, pos].item())
-                kv_indices_to_free.append(kv_idx)
-                for layer_id in range(num_layers):
-                    k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
-                    k_buf[kv_idx].zero_()
-                    v_buf[kv_idx].zero_()
-            self._kv_trim_info[req_pool_idx] = {
+            actual_trim = trim_counts_per_bid[bid]
+            kv_indices_to_free = kv_indices_all[trim_offset:trim_offset + actual_trim]
+            trim_offset += actual_trim
+            self._kv_trim_info[rpx] = {
                 "kv_indices": kv_indices_to_free,
                 "trim_count": trim_count,
             }
 
-        # Profiling
+        # Stats
         self._stats["total_forwards"] += 1
         self._stats["total_tokens"] += sum(len(t) for t in next_token_ids_list)
         if self._stats["total_forwards"] % 500 == 0:
@@ -302,7 +449,6 @@ class DreamShiftBlock2(DllmAlgorithm):
             )
             logger.info(
                 f"[DreamShiftBlock2] fwd={s['total_forwards']}, "
-                f"tok={s['total_tokens']}, "
                 f"tok/fwd={tok_per_fwd:.2f}, "
                 f"accept={accept_rate:.1f}%"
             )

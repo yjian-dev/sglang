@@ -51,7 +51,6 @@ class ReqDllmMixin:
         min_required_length = prefix_length + self.dllm_config.block_size
 
         if len(self.fill_ids) < min_required_length:
-            # still incoming stage
             return
 
         input_block = self.fill_ids[prefix_length:min_required_length]

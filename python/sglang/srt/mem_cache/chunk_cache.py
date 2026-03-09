@@ -71,8 +71,14 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        # Use dllm_kv_valid_len when set (KV trim: exclude freed positions).
-        kv_len = getattr(req, "dllm_kv_valid_len", None) or len(req.fill_ids)
+        # Use dllm_kv_valid_len when set (KV trim: exclude freed positions),
+        # then kv_committed_len (accurate after prepare_for_extend sets it),
+        # then fall back to len(fill_ids) (may be truncated by scheduler).
+        kv_len = (
+            getattr(req, "dllm_kv_valid_len", None)
+            or getattr(req, "kv_committed_len", None)
+            or len(req.fill_ids)
+        )
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_len
         ]

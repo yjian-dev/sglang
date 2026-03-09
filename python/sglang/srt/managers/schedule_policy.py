@@ -539,9 +539,6 @@ class PrefillAdder:
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
         trunc_len = (
             min(self.rem_dllm_tokens, self.dllm_block_size)
             // self.page_size
@@ -569,11 +566,6 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        # Truncate input length to available tokens and cap to block_size so each
-        # round processes exactly one block. Without this cap, extend_input_len
-        # could exceed block_size (e.g. when the _get_dllm_remain_tokens fallback
-        # returns rem_dllm_tokens > block_size), causing a positions/input_ids
-        # size mismatch since positions are always generated for exactly block_size.
         max_extend = min(req.extend_input_len, _rem_tokens, self.dllm_block_size)
         truncated = req.extend_input_len > max_extend
         req.extend_input_len = max_extend

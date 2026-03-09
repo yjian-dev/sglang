@@ -7,6 +7,8 @@ Usage:
   python scripts/eval_gsm8k.py --ports 30000 30001   # custom ports
 """
 import argparse
+import json
+import os
 import requests
 import time
 import re
@@ -51,6 +53,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()
 
     ds = load_dataset("gsm8k", "main", split="test")
@@ -102,6 +106,14 @@ def main():
     print(f"Avg tok/problem:   {total_tok / N:.0f}")
     print(f"Hit max_tokens:    {length_limited}")
     print(f"Errors (timeout):  {errors}")
+
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        tag = f"_{args.tag}" if args.tag else ""
+        with open(os.path.join(args.output_dir, f"gsm8k_summary{tag}.json"), "w") as f:
+            json.dump({"accuracy": correct / N * 100, "correct": correct, "total": N,
+                       "errors": errors, "total_tok": total_tok}, f, indent=2)
+        print(f"Saved to {args.output_dir}/")
 
 
 if __name__ == "__main__":

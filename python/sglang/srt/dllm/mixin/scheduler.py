@@ -25,6 +25,58 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
+    def _try_dllm_fast_decode(self: Scheduler) -> Optional[ScheduleBatch]:
+        """Fast path: reuse last_batch for pure DLLM decode steps.
+
+        Avoids the full get_new_batch_dllm() → init_new → prepare_for_extend
+        pipeline.  Only valid when:
+          1. No new waiting requests to schedule
+          2. All DLLM staging requests are in STAGING_DECODE phase
+          3. last_batch exists and is non-empty
+        Returns the reused batch, or None to fall back to the slow path.
+        """
+        # Must have a previous batch to reuse
+        if self.last_batch is None or self.last_batch.is_empty():
+            return None
+        if not self.last_batch.forward_mode.is_dllm_extend():
+            return None
+
+        # No new requests waiting → pure decode
+        if self.waiting_queue:
+            return None
+
+        # All staging requests must be decode (have mask tokens)
+        staging = self.dllm_manager.staging_queue
+        if not staging:
+            return None
+        if any(req.finished() for req in staging):
+            return None
+
+        # Reuse last_batch: update DLLM state + prepare lightweight decode
+        batch = self.last_batch
+        # Filter finished reqs first
+        batch.filter_batch()
+        if batch.is_empty():
+            return None
+
+        batch.prepare_for_dllm_decode()
+
+        # Keep staging queue consistent
+        self.dllm_manager.staging_queue = list(batch.reqs)
+        self.dllm_manager.waiting_queue = []
+
+        # Record prefill stats for logging
+        from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+
+        batch.prefill_stats = PrefillStats(
+            log_input_tokens=batch.extend_num_tokens,
+            log_hit_tokens=0,
+            new_token_ratio=0,
+            running_bs=0,
+            num_new_seqs=len(batch.reqs),
+        )
+        return batch
+
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
         if self.try_preemption:
@@ -106,32 +158,28 @@ class SchedulerDllmMixin:
         )
 
     def _process_dllm_batches(self: Scheduler, adder: PrefillAdder) -> ForwardMode:
-        """Process prefill or decode batches for DLLM."""
+        """Process prefill or decode batches for DLLM.
+
+        Original prefill-first policy but with one-shot prefill:
+        each new request completes prefill in 1 round, then joins
+        the decode batch. This naturally builds up batch size.
+        """
         forward_mode = ForwardMode.DLLM_EXTEND
 
-        # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
             self._process_batch_by_phase(
-                adder,
-                prefill_reqs,
-                DllmReqPhase.STAGING_PREFILL,
-                DllmReqPhase.INCOMING_PREFILL,
+                adder, prefill_reqs,
+                DllmReqPhase.STAGING_PREFILL, DllmReqPhase.INCOMING_PREFILL,
             )
         else:
-            # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
             self._process_batch_by_phase(
-                adder,
-                decode_reqs,
-                DllmReqPhase.STAGING_DECODE,
-                DllmReqPhase.INCOMING_DECODE,
+                adder, decode_reqs,
+                DllmReqPhase.STAGING_DECODE, DllmReqPhase.INCOMING_DECODE,
             )
 
-        # Safety guard: if can_run_list contains a mix of prefill (0-mask) and
-        # decode (mask-containing) requests, keep only the prefill ones.
-        # This prevents mixed-attention-mode batches where causal-prefill
-        # requests would be processed with bidirectional attention.
+        # Safety guard
         if adder.can_run_list:
             has_prefill = any(req.is_dllm_prefill() for req in adder.can_run_list)
             has_decode = any(not req.is_dllm_prefill() for req in adder.can_run_list)
