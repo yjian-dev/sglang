@@ -121,6 +121,8 @@ class DreamShiftBlock2(DllmAlgorithm):
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
         self._carry: Dict[int, int] = {}
         self._pending: Dict[int, int] = {}
+        # Force next Case C to use this token instead of sampling
+        self._force_next_token: Dict[int, int] = {}
         # Spec verification: draft distribution q(x) for the accepted t_carry
         self._pending_draft_probs: Dict[int, torch.Tensor] = {}
 
@@ -231,16 +233,21 @@ class DreamShiftBlock2(DllmAlgorithm):
                 case_codes.append(1)
                 tok0s.append(pending)
             else:
-                # Case C — need to sample t_0
-                prev = self._prev_last_logits.get(rpx)
-                if prev is not None:
-                    pre_sample_logits.append(prev)
-                    pre_sample_bids.append(bid)
-                    pre_sample_cases.append(2)
-                    tok0s.append(None)  # filled after sampling
+                # Case C — use forced token (from spec reject) or sample t_0
+                forced = self._force_next_token.pop(rpx, None)
+                if forced is not None:
+                    forward_batch.input_ids[bid * blk] = forced
+                    tok0s.append(forced)
                 else:
-                    forward_batch.input_ids[bid * blk] = self.mask_id
-                    tok0s.append(self.mask_id)
+                    prev = self._prev_last_logits.get(rpx)
+                    if prev is not None:
+                        pre_sample_logits.append(prev)
+                        pre_sample_bids.append(bid)
+                        pre_sample_cases.append(2)
+                        tok0s.append(None)  # filled after sampling
+                    else:
+                        forward_batch.input_ids[bid * blk] = self.mask_id
+                        tok0s.append(self.mask_id)
                 case_codes.append(2)
                 tok1s.append(None)
 
@@ -339,7 +346,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             rpx = req_pool_indices_cpu[bid]
             sl = int(seq_lens_cpu[bid])
             if rpx in spec_rejected:
-                tc = 2  # spec reject: free carry + MASK KV
+                tc = 1  # spec reject: free MASK only (carry KV overwritten next round)
             elif case_codes[bid] <= 1:
                 tc = 1  # A/B: trim MASK only
             else:
@@ -368,18 +375,18 @@ class DreamShiftBlock2(DllmAlgorithm):
 
             # Spec verification may override Case A accept
             if rpx in spec_rejected:
-                # Spec rejected: DON'T output corrected carry now.
-                # Instead set it as pending — next round Case B will
-                # output it with clean KV. This avoids double-output.
-                # Reference: generated_tokens[-1] = new_carry (replace, not append)
-                output_tokens = []  # nothing new — corrected carry deferred
-                dllm_tokens = [t0, self.mask_id, self.mask_id]
+                # Spec rejected: output corrected carry (1 token). DON'T set
+                # as pending — instead force next Case C to use it as t_0,
+                # where it will get FRESH clean KV. This avoids double-output
+                # AND avoids wasting a forward (deferred approach wastes 1).
+                output_tokens = [t1]  # corrected carry, 1 token output
+                dllm_tokens = [t0, t1, self.mask_id]
                 self._prev_last_logits[rpx] = full_logits[bid * blk + 0]
-                self._pending[rpx] = t1  # corrected carry → pending
+                self._force_next_token[rpx] = t1  # next Case C uses this
                 self._pending_draft_probs.pop(rpx, None)
                 self._stats["reject_count"] += 1
-                advance = 1   # only pending committed
-                trim_count = 2  # free carry + MASK KV
+                advance = 2   # pending + corrected committed
+                trim_count = 1  # only MASK trimmed from kv_committed_len
             elif cc <= 1:  # A or B (normal path)
                 if accepted:
                     output_tokens = [t1, t_diff]
