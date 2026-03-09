@@ -3,4 +3,4 @@ confidence_threshold: 0.0
 temperature: 1.0
 top_k: 50
 top_p: 0.95
-use_spec_verify: true
+use_spec_verify: false
