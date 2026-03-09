@@ -339,7 +339,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             rpx = req_pool_indices_cpu[bid]
             sl = int(seq_lens_cpu[bid])
             if rpx in spec_rejected:
-                tc = 1  # spec reject: trim MASK only (TODO: trim=2 causes KV bug)
+                tc = 2  # spec reject: free carry + MASK KV
             elif case_codes[bid] <= 1:
                 tc = 1  # A/B: trim MASK only
             else:
@@ -368,29 +368,18 @@ class DreamShiftBlock2(DllmAlgorithm):
 
             # Spec verification may override Case A accept
             if rpx in spec_rejected:
-                # Spec rejected: overwrite stale carry KV with pending's
-                # clean KV. This prevents attention from reading the wrong
-                # carry token's hidden states. No kv_committed_len change
-                # needed (prefix stays the same).
-                output_tokens = [t1]
-                dllm_tokens = [t0, t1, self.mask_id]
+                # Spec rejected: DON'T output corrected carry now.
+                # Instead set it as pending — next round Case B will
+                # output it with clean KV. This avoids double-output.
+                # Reference: generated_tokens[-1] = new_carry (replace, not append)
+                output_tokens = []  # nothing new — corrected carry deferred
+                dllm_tokens = [t0, self.mask_id, self.mask_id]
                 self._prev_last_logits[rpx] = full_logits[bid * blk + 0]
-                self._pending[rpx] = t1  # corrected carry becomes pending
+                self._pending[rpx] = t1  # corrected carry → pending
                 self._pending_draft_probs.pop(rpx, None)
-                # Copy pending's clean KV → carry position (overwrite stale)
-                sl = int(seq_lens_cpu[bid])
-                pending_pos = sl - 3  # position of pending in KV cache
-                carry_pos = sl - 2    # position of stale carry
-                pending_kv = int(req_to_token[rpx, pending_pos].item())
-                carry_kv = int(req_to_token[rpx, carry_pos].item())
-                token_to_kv_pool = forward_batch.token_to_kv_pool
-                for lid in range(model_runner.model_config.num_hidden_layers):
-                    k_buf, v_buf = token_to_kv_pool.get_kv_buffer(lid)
-                    k_buf[carry_kv].copy_(k_buf[pending_kv])
-                    v_buf[carry_kv].copy_(v_buf[pending_kv])
                 self._stats["reject_count"] += 1
-                advance = 2
-                trim_count = 1
+                advance = 1   # only pending committed
+                trim_count = 2  # free carry + MASK KV
             elif cc <= 1:  # A or B (normal path)
                 if accepted:
                     output_tokens = [t1, t_diff]
@@ -452,6 +441,21 @@ class DreamShiftBlock2(DllmAlgorithm):
                 "kv_indices": kv_indices_to_free,
                 "trim_count": trim_count,
             }
+
+        # Debug: log every decode step for single-request tracing
+        if batch_size == 1:
+            rpx0 = req_pool_indices_cpu[0]
+            cc0 = case_codes[0]
+            case_name = {0:"A", 1:"B", 2:"C"}.get(cc0, "?")
+            sr = " SPEC_REJ" if rpx0 in spec_rejected else ""
+            out_toks = next_token_ids_list[0].tolist() if next_token_ids_list else []
+            accepted_str = "acc" if carry_probs_cpu[0] >= self.confidence_threshold else "rej"
+            logger.info(
+                f"[STEP] {case_name}{sr} "
+                f"in=[{tok0s[0]},{tok1s[0]}] diff={diff_ids_cpu[0]} carry={carry_ids_cpu[0]}({accepted_str}) "
+                f"→ out={out_toks} adv={self._advance_override.get(rpx0,'?')} trim={trim_counts_per_bid[0]} "
+                f"next: pend={self._pending.get(rpx0,'∅')} carry={self._carry.get(rpx0,'∅')}"
+            )
 
         # Stats
         _t3 = _t.perf_counter()
