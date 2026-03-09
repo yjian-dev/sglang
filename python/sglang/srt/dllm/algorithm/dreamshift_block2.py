@@ -202,6 +202,7 @@ class DreamShiftBlock2(DllmAlgorithm):
         case_codes = []       # int per bid
         tok0s = []            # tok_0 per bid (int)
         tok1s = []            # tok_1 per bid (int or None)
+        was_forced = [False] * batch_size  # True if t0 came from _force_next_token
         pre_sample_logits = []
         pre_sample_bids = []
         pre_sample_cases = []  # 1=B, 2=C
@@ -235,6 +236,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             else:
                 # Case C — use forced token (from spec reject) or sample t_0
                 forced = self._force_next_token.pop(rpx, None)
+                was_forced[bid] = forced is not None
                 if forced is not None:
                     forward_batch.input_ids[bid * blk] = forced
                     tok0s.append(forced)
@@ -346,7 +348,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             rpx = req_pool_indices_cpu[bid]
             sl = int(seq_lens_cpu[bid])
             if rpx in spec_rejected:
-                tc = 1  # spec reject: free MASK only (carry KV overwritten next round)
+                tc = 2  # spec reject: free carry + MASK (carry pos reused next round)
             elif case_codes[bid] <= 1:
                 tc = 1  # A/B: trim MASK only
             else:
@@ -385,8 +387,8 @@ class DreamShiftBlock2(DllmAlgorithm):
                 self._force_next_token[rpx] = t1  # next Case C uses this
                 self._pending_draft_probs.pop(rpx, None)
                 self._stats["reject_count"] += 1
-                advance = 2   # pending + corrected committed
-                trim_count = 1  # only MASK trimmed from kv_committed_len
+                advance = 1   # only pending committed; carry pos reused next round
+                trim_count = 2  # free carry + MASK → next round overwrites carry pos
             elif cc <= 1:  # A or B (normal path)
                 if accepted:
                     output_tokens = [t1, t_diff]
@@ -413,7 +415,7 @@ class DreamShiftBlock2(DllmAlgorithm):
                 trim_count = 1
             else:  # C
                 if accepted:
-                    output_tokens = [t0, t_diff]
+                    output_tokens = [t_diff] if was_forced[bid] else [t0, t_diff]
                     dllm_tokens = [t0, t_diff, self.mask_id]
                     self._pending[rpx] = t_diff
                     self._carry[rpx] = t_carry
@@ -427,7 +429,7 @@ class DreamShiftBlock2(DllmAlgorithm):
                         )
                     self._stats["accept_count"] += 1
                 else:
-                    output_tokens = [t0]
+                    output_tokens = [] if was_forced[bid] else [t0]
                     dllm_tokens = [t0, self.mask_id, self.mask_id]
                     self._prev_last_logits[rpx] = diff_logits[bid]
                     self._pending_draft_probs.pop(rpx, None)
