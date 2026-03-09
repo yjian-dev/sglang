@@ -294,7 +294,7 @@ class DreamShiftBlock2(DllmAlgorithm):
 
         # Spec verification for Case A (before trim, since it may change trim count)
         spec_rejected = set()
-        if self.use_spec_verify:
+        if self.use_spec_verify and batch_size > 0:
             for bid in range(batch_size):
                 cc = case_codes[bid]
                 if cc != 0:  # Only Case A has both pending + carry to verify
@@ -336,7 +336,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             rpx = req_pool_indices_cpu[bid]
             sl = int(seq_lens_cpu[bid])
             if rpx in spec_rejected:
-                tc = 2  # spec reject: trim carry + MASK
+                tc = 1  # spec reject: trim MASK only (keep carry KV)
             elif case_codes[bid] <= 1:
                 tc = 1  # A/B: trim MASK only
             else:
@@ -365,14 +365,17 @@ class DreamShiftBlock2(DllmAlgorithm):
 
             # Spec verification may override Case A accept
             if rpx in spec_rejected:
-                # Spec rejected: output corrected t1 only, trim carry+MASK (2 slots)
+                # Spec rejected: output corrected t1, keep pending+carry KV,
+                # only trim MASK. The carry KV is stale but this avoids KV
+                # corruption; the corrected carry will get clean KV as pending
+                # in the next round if accepted again.
                 output_tokens = [t1]
                 dllm_tokens = [t0, t1, self.mask_id]
                 self._prev_last_logits[rpx] = full_logits[bid * blk + 0]
                 self._pending_draft_probs.pop(rpx, None)
                 self._stats["reject_count"] += 1
-                advance = 2  # pending(t0) + corrected(t1) committed
-                trim_count = 2  # trim carry + MASK KV slots
+                advance = 2
+                trim_count = 1  # only trim MASK, keep carry KV
             elif cc <= 1:  # A or B (normal path)
                 if accepted:
                     output_tokens = [t1, t_diff]
@@ -438,7 +441,8 @@ class DreamShiftBlock2(DllmAlgorithm):
         # Stats
         self._stats["total_forwards"] += 1
         self._stats["total_tokens"] += sum(len(t) for t in next_token_ids_list)
-        if self._stats["total_forwards"] % 500 == 0:
+        n_spec_rej = len(spec_rejected)
+        if self._stats["total_forwards"] % 100 == 0 or n_spec_rej > 0:
             s = self._stats
             tok_per_fwd = s["total_tokens"] / max(s["total_forwards"], 1)
             total_decisions = s["accept_count"] + s["reject_count"]
@@ -450,7 +454,8 @@ class DreamShiftBlock2(DllmAlgorithm):
             logger.info(
                 f"[DreamShiftBlock2] fwd={s['total_forwards']}, "
                 f"tok/fwd={tok_per_fwd:.2f}, "
-                f"accept={accept_rate:.1f}%"
+                f"accept={accept_rate:.1f}%, "
+                f"spec_rej={n_spec_rej}, cases={case_codes}"
             )
 
         return logits_output, next_token_ids_list, out.can_run_graph
