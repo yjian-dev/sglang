@@ -185,6 +185,7 @@ class DreamShiftBlock2(DllmAlgorithm):
             return out.logits_output, [], out.can_run_graph
 
         # ── Decode ─────────────────────────────────────────────────────
+        import time as _t; _t0 = _t.perf_counter()
         blk = self.block_size
         self._dllm_write_override.clear()
         self._kv_trim_info.clear()
@@ -260,9 +261,11 @@ class DreamShiftBlock2(DllmAlgorithm):
                     tok0s[bid] = tok
 
         # Phase 2: Single forward
+        _t1 = _t.perf_counter()
         forward_batch.dllm_force_causal = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         forward_batch.dllm_force_causal = False
+        _t2 = _t.perf_counter()
         logits_output = out.logits_output
         full_logits = logits_output.full_logits
 
@@ -439,10 +442,14 @@ class DreamShiftBlock2(DllmAlgorithm):
             }
 
         # Stats
+        _t3 = _t.perf_counter()
         self._stats["total_forwards"] += 1
         self._stats["total_tokens"] += sum(len(t) for t in next_token_ids_list)
+        self._stats.setdefault("p1", 0.0); self._stats["p1"] += (_t1-_t0)*1000
+        self._stats.setdefault("p2", 0.0); self._stats["p2"] += (_t2-_t1)*1000
+        self._stats.setdefault("p3", 0.0); self._stats["p3"] += (_t3-_t2)*1000
         n_spec_rej = len(spec_rejected)
-        if self._stats["total_forwards"] % 100 == 0 or n_spec_rej > 0:
+        if self._stats["total_forwards"] % 500 == 0 or n_spec_rej > 0:
             s = self._stats
             tok_per_fwd = s["total_tokens"] / max(s["total_forwards"], 1)
             total_decisions = s["accept_count"] + s["reject_count"]
@@ -451,11 +458,12 @@ class DreamShiftBlock2(DllmAlgorithm):
                 if total_decisions > 0
                 else 0
             )
+            n = s["total_forwards"]
             logger.info(
-                f"[DreamShiftBlock2] fwd={s['total_forwards']}, "
+                f"[DreamShiftBlock2] fwd={n}, "
                 f"tok/fwd={tok_per_fwd:.2f}, "
                 f"accept={accept_rate:.1f}%, "
-                f"spec_rej={n_spec_rej}, cases={case_codes}"
+                f"p1={s['p1']/n:.2f} p2={s['p2']/n:.2f} p3={s['p3']/n:.2f}ms"
             )
 
         return logits_output, next_token_ids_list, out.can_run_graph
