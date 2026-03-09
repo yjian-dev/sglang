@@ -368,15 +368,26 @@ class DreamShiftBlock2(DllmAlgorithm):
 
             # Spec verification may override Case A accept
             if rpx in spec_rejected:
-                # Spec rejected: trim carry+MASK for clean KV.
-                # corrected_carry gets clean KV as t_prev in next round.
+                # Spec rejected: output corrected t1, set as PENDING for
+                # clean KV in next round. Zero-out stale carry KV to prevent
+                # attention from reading wrong hidden states.
                 output_tokens = [t1]
                 dllm_tokens = [t0, t1, self.mask_id]
                 self._prev_last_logits[rpx] = full_logits[bid * blk + 0]
+                self._pending[rpx] = t1  # corrected carry becomes pending
                 self._pending_draft_probs.pop(rpx, None)
+                # Zero-out stale carry KV (position seq_len-2)
+                carry_pos = int(seq_lens_cpu[bid]) - 2
+                carry_kv_idx = int(req_to_token[rpx, carry_pos].item())
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                num_layers = model_runner.model_config.num_hidden_layers
+                for layer_id in range(num_layers):
+                    k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
+                    k_buf[carry_kv_idx].zero_()
+                    v_buf[carry_kv_idx].zero_()
                 self._stats["reject_count"] += 1
-                advance = 2  # pending + corrected_carry committed
-                trim_count = 1  # trim MASK only (TODO: trim=2 for clean KV)
+                advance = 2
+                trim_count = 1
             elif cc <= 1:  # A or B (normal path)
                 if accepted:
                     output_tokens = [t1, t_diff]
