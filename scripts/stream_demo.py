@@ -22,6 +22,7 @@ def stream_chat(url, prompt, max_tokens=1024, temperature=1.0, top_k=50, top_p=0
             "top_k": top_k,
             "top_p": top_p,
             "stream": True,
+            "stream_options": {"include_usage": True},
         },
         stream=True,
         timeout=120,
@@ -37,18 +38,29 @@ def stream_chat(url, prompt, max_tokens=1024, temperature=1.0, top_k=50, top_p=0
         if data.strip() == "[DONE]":
             break
         chunk = json.loads(data)
-        delta = chunk["choices"][0]["delta"]
+        choices = chunk.get("choices", [])
+        if not choices:
+            usage = chunk.get("usage")
+            if usage and "completion_tokens" in usage:
+                token_count = usage["completion_tokens"]
+            continue
+        delta = choices[0]["delta"]
         content = delta.get("content", "")
         if content:
             if first_token_time is None:
                 first_token_time = time.time()
             sys.stdout.write(content)
             sys.stdout.flush()
-            token_count += len(content.split())  # approximate
+            token_count += 1  # fallback: count chunks
+        usage = chunk.get("usage")
+        if usage and "completion_tokens" in usage:
+            token_count = usage["completion_tokens"]  # exact count overrides
 
     elapsed = time.time() - t0
     ttft = (first_token_time - t0) if first_token_time else 0
-    print(f"\n\n--- {elapsed:.1f}s total, TTFT {ttft:.2f}s ---")
+    decode_time = (time.time() - first_token_time) if first_token_time else elapsed
+    tps = token_count / decode_time if decode_time > 0 and token_count > 0 else 0
+    print(f"\n\n--- {token_count} tokens, {elapsed:.1f}s total, TTFT {ttft:.2f}s, {tps:.1f} tok/s ---")
 
 
 def main():
