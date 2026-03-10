@@ -2001,6 +2001,74 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+    def prepare_for_dllm_decode(self):
+        """Lightweight DLLM decode prep — reuse batch like prepare_for_decode().
+
+        Mirrors what prepare_for_extend() computes, but reuses the batch object.
+        All values are derived from req state (not incremental), matching the
+        ground truth observed from prepare_for_extend():
+          fill_ids_len = N,  prefix_len = N - block_size,  extend = block_size
+          kv_committed = kv_allocated = prefix_len
+        """
+        from sglang.srt.mem_cache.common import alloc_token_slots
+
+        bs = len(self.reqs)
+        block_size = self.dllm_config.block_size
+
+        # 1. Update per-request DLLM state (same as dllm_manager.init_next_round)
+        #    Then cap fill_ids like add_dllm_staging_req does (line 580).
+        input_ids_list = []
+        seq_lens = []
+        prefix_lens = []
+
+        for req in self.reqs:
+            req.init_next_round_input()  # appends MASKs, advances offset
+
+            # Replicate add_dllm_staging_req's truncation:
+            #   req.extend_input_len was set by init_next_round_input
+            #   cap to block_size, then truncate fill_ids
+            req.extend_input_len = min(req.extend_input_len, block_size)
+            prefix_len = len(req.prefix_indices)
+            req.fill_ids = req.fill_ids[: prefix_len + req.extend_input_len]
+
+            new_ids = req.fill_ids[prefix_len:]
+            input_ids_list.extend(new_ids)
+
+            sl = len(req.fill_ids)
+            seq_lens.append(sl)
+            prefix_lens.append(prefix_len)
+
+        # 2. Rebuild batch tensors from ground truth
+        self.forward_mode = ForwardMode.DLLM_EXTEND
+        self.input_ids = torch.tensor(
+            input_ids_list, dtype=torch.int64, device=self.device
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+        self.seq_lens_sum = sum(seq_lens)
+        self.prefix_lens = prefix_lens
+        self.extend_lens = [block_size] * bs
+        self.extend_num_tokens = bs * block_size
+        self.extend_logprob_start_lens = None
+        self.output_ids = None
+
+        # 3. Allocate KV slots and write to req_to_token_pool
+        num_tokens = bs * block_size
+        out_cache_loc = alloc_token_slots(self.tree_cache, num_tokens)
+        for i, req in enumerate(self.reqs):
+            for t in range(block_size):
+                slot = out_cache_loc[i * block_size + t]
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, prefix_lens[i] + t
+                ] = slot
+        self.out_cache_loc = out_cache_loc
+
+        # 4. Update per-request memory fields (set, not increment)
+        for i, req in enumerate(self.reqs):
+            req.kv_committed_len = seq_lens[i]
+            req.kv_allocated_len = seq_lens[i]
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info

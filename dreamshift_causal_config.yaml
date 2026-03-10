@@ -1,0 +1,4 @@
+block_size: 1
+temperature: 1.0
+top_k: 50
+top_p: 0.95
