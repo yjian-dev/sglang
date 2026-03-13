@@ -411,10 +411,10 @@ class TpModelWorker(BaseTpWorker):
         return self.dllm_algorithm is not None
 
     def _forward_batch_generation_dllm(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, overlap_fn=None,
     ) -> GenerationBatchResult:
         logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
-            self.model_runner, forward_batch
+            self.model_runner, forward_batch, overlap_fn=overlap_fn,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -450,7 +450,9 @@ class TpModelWorker(BaseTpWorker):
             assert forward_batch is not None
 
         if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch)
+            return self._forward_batch_generation_dllm(
+                forward_batch, overlap_fn=getattr(model_worker_batch, '_dllm_overlap_fn', None)
+            )
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(

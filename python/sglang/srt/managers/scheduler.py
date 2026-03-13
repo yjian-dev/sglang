@@ -1100,6 +1100,60 @@ class Scheduler(
                 )
 
     @DynamicGradMode()
+    def _dllm_decode_loop(self, initial_batch):
+        """DLLM decode-mode inner loop: reuse batch with prepare_for_dllm_decode."""
+        steps = 0
+        exit_reason = "unknown"
+        batch = initial_batch
+        batch._dllm_decode_mode = True
+
+        try:
+            while True:
+                recv_reqs = self.recv_requests()
+                if recv_reqs:
+                    self.process_input_requests(recv_reqs)
+
+                if self.waiting_queue:
+                    exit_reason = "new_requests"
+                    break
+
+                # Handle finished requests in-place
+                if any(r.finished() for r in batch.reqs):
+                    self.dllm_manager.staging_queue = [
+                        r for r in self.dllm_manager.staging_queue
+                        if not r.finished()
+                    ]
+                    batch.output_ids = None
+                    batch.filter_batch()
+                    if batch.is_empty():
+                        exit_reason = "all_finished"
+                        break
+
+                # Lightweight batch prep
+                success = batch.prepare_for_dllm_decode()
+                if not success:
+                    exit_reason = "alloc_failed"
+                    break
+
+                self.cur_batch = batch
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+
+                self.dllm_manager.staging_queue = [
+                    r for r in batch.reqs if not r.finished()
+                ]
+                self.last_batch = batch
+                steps += 1
+        except Exception as e:
+            exit_reason = f"exception: {e}"
+            logger.error(f"[DLLM decode loop] exception after {steps} steps: {e}")
+            import traceback
+            traceback.print_exc()
+
+        batch._dllm_decode_mode = False
+        if steps > 0:
+            logger.info(f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}")
+
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -1117,6 +1171,17 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+
+                # DLLM: enter fast decode loop after first decode step
+                # (not after prefill — prefill doesn't set dllm_next_advance)
+                if (self.dllm_config is not None
+                    and self.dllm_manager.any_staging_reqs()
+                    and not self.waiting_queue
+                    and not any(r.finished() for r in batch.reqs)
+                    and not any(r.is_dllm_prefill() for r in batch.reqs)):
+                    self.last_batch = batch
+                    self._dllm_decode_loop(batch)
+                    continue  # Re-enter outer loop for scheduling
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1886,8 +1951,8 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+            # Skip stash (cache_unfinished_req) — already done by process_batch_result_dllm.
+            # The prefix_indices are up-to-date from the last decode step.
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge

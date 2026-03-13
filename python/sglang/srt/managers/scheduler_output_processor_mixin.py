@@ -378,27 +378,46 @@ class SchedulerOutputProcessorMixin:
         )
 
         if not result.next_token_ids:
-            # Prefilling stage: no new tokens but KV was computed.
-            # Update prefix_indices for all requests so the next round
-            # sees the correct prefix length.
             for req in batch.reqs:
                 self.tree_cache.cache_unfinished_req(req)
+
+        # Batch KV free: collect GPU tensor slices directly (no CPU round-trip)
+        kv_gpu_parts = []
+        kv_cpu_parts = []
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            trim_info = kv_trim_info.get(batch.reqs[idx].req_pool_idx)
+            if trim_info is not None:
+                gpu_indices = trim_info.get("kv_indices_gpu")
+                if gpu_indices is not None:
+                    kv_gpu_parts.append(gpu_indices)
+                else:
+                    # Fallback for legacy CPU list format
+                    cpu_indices = trim_info.get("kv_indices")
+                    if cpu_indices:
+                        kv_cpu_parts.extend(cpu_indices)
+        if kv_gpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+        if kv_cpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.tensor(
+                kv_cpu_parts, dtype=torch.int64,
+                device=self.token_to_kv_pool_allocator.device,
+            ))
 
         for idx in range(batch.batch_size()):
             if not result.next_token_ids:
                 break
 
             req = batch.reqs[idx]
-            next_token_ids = result.next_token_ids[idx].tolist()
+            raw = result.next_token_ids[idx]
+            next_token_ids = raw if isinstance(raw, list) else raw.tolist()
             self.num_generated_tokens += len(next_token_ids)
 
-            # Sync decoded tokens back into dllm_ids.
-            # Use override if the algorithm provided separate dllm tokens.
             req_pool_idx = req.req_pool_idx
             dllm_tokens = dllm_write_override.pop(req_pool_idx, None)
             if req.dllm_ids:
                 if dllm_tokens is not None:
-                    # Override: write full block from algorithm
                     write_start = req.dllm_block_offset
                     req.dllm_ids[
                         write_start : write_start + len(dllm_tokens)
@@ -414,15 +433,9 @@ class SchedulerOutputProcessorMixin:
                         write_start : write_start + len(next_token_ids)
                     ] = next_token_ids
 
-            # Handle KV trim: free dirty KV slots, adjust accounting
+            # Handle KV trim accounting (actual free done in batch above)
             trim_info = kv_trim_info.pop(req_pool_idx, None)
             if trim_info is not None:
-                kv_indices_to_free = torch.tensor(
-                    trim_info["kv_indices"],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                )
-                self.token_to_kv_pool_allocator.free(kv_indices_to_free)
                 trim_count = trim_info["trim_count"]
                 req.kv_committed_len -= trim_count
                 req.kv_allocated_len -= trim_count
@@ -430,19 +443,24 @@ class SchedulerOutputProcessorMixin:
             else:
                 req.dllm_kv_valid_len = None
 
-            # Set variable advance for next _init_fill_ids_for_dllm
             adv = advance_override.pop(req_pool_idx, None)
             if adv is not None:
                 req.dllm_next_advance = adv
 
-            for _token_idx, next_token_id in enumerate(next_token_ids):
+            finished = False
+            for next_token_id in next_token_ids:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
+                    # Clean up algorithm per-request state to prevent stale
+                    # data when req_pool_idx is recycled by a new request.
+                    if dllm_algo is not None:
+                        dllm_algo.cleanup_request(req_pool_idx)
+                    finished = True
                     break
-
+            if not finished:
                 self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -1043,6 +1061,12 @@ class SchedulerOutputProcessorMixin:
                         if not self.model_config.is_multimodal_gen
                         else False
                     )
+
+            # Skip if no new tokens since last stream (avoids empty pipeline round-trip,
+            # critical for DLLM where prefill produces 0 tokens)
+            if should_output and not req.finished():
+                if req.send_token_offset >= len(req.output_ids):
+                    should_output = False
 
             if should_output:
                 send_token_offset = req.send_token_offset

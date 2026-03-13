@@ -2004,42 +2004,69 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_dllm_decode(self):
         """Lightweight DLLM decode prep — reuse batch like prepare_for_decode().
 
-        Mirrors what prepare_for_extend() computes, but reuses the batch object.
-        All values are derived from req state (not incremental), matching the
-        ground truth observed from prepare_for_extend():
-          fill_ids_len = N,  prefix_len = N - block_size,  extend = block_size
-          kv_committed = kv_allocated = prefix_len
+        IMPORTANT: Allocates KV BEFORE modifying req state so that on allocation
+        failure, no state is corrupted and the caller can safely fall back.
+
+        Uses kv_committed_len for prefix_len (not prefix_indices), so this
+        does NOT require cache_unfinished_req to have been called beforehand.
         """
         from sglang.srt.mem_cache.common import alloc_token_slots
 
         bs = len(self.reqs)
         block_size = self.dllm_config.block_size
 
-        # 1. Update per-request DLLM state (same as dllm_manager.init_next_round)
-        #    Then cap fill_ids like add_dllm_staging_req does (line 580).
+        # 1. PRE-ALLOCATE KV slots BEFORE any state mutation
+        num_tokens = bs * block_size
+        out_cache_loc = alloc_token_slots(self.tree_cache, num_tokens)
+        if out_cache_loc is None:
+            return False  # No state modified — safe to fall back
+
+        # 2. Now safe to modify req state
         input_ids_list = []
         seq_lens = []
         prefix_lens = []
 
+        _log_count = getattr(self, '_dllm_prep_log_count', 0)
         for req in self.reqs:
-            req.init_next_round_input()  # appends MASKs, advances offset
+            # Update prefix_indices from current KV state (mirrors stash_chunked_request)
+            self.tree_cache.cache_unfinished_req(req)
+            pre_offset = req.dllm_block_offset
+            pre_advance = req.dllm_next_advance
+            pre_fill_len = len(req.fill_ids) if req.fill_ids else 0
+            pre_prefix_len = len(req.prefix_indices) if req.prefix_indices is not None else 0
 
-            # Replicate add_dllm_staging_req's truncation:
-            #   req.extend_input_len was set by init_next_round_input
-            #   cap to block_size, then truncate fill_ids
+            req.init_next_round_input()  # appends MASKs, advances offset
             req.extend_input_len = min(req.extend_input_len, block_size)
+
             prefix_len = len(req.prefix_indices)
             req.fill_ids = req.fill_ids[: prefix_len + req.extend_input_len]
 
             new_ids = req.fill_ids[prefix_len:]
             input_ids_list.extend(new_ids)
 
+            if _log_count < 5:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[prep_dllm_decode] rpx={req.req_pool_idx} "
+                    f"pre_offset={pre_offset} pre_advance={pre_advance} "
+                    f"pre_fill={pre_fill_len} pre_prefix={pre_prefix_len} "
+                    f"post_prefix={prefix_len} extend={req.extend_input_len} "
+                    f"new_ids={new_ids[:5]} fill_len={len(req.fill_ids)}"
+                )
+
             sl = len(req.fill_ids)
             seq_lens.append(sl)
             prefix_lens.append(prefix_len)
 
-        # 2. Rebuild batch tensors from ground truth
+        if _log_count < 5:
+            self._dllm_prep_log_count = _log_count + 1
+
+        # 3. Rebuild batch tensors (including req_pool_indices for new reqs)
         self.forward_mode = ForwardMode.DLLM_EXTEND
+        self.req_pool_indices = torch.tensor(
+            [req.req_pool_idx for req in self.reqs],
+            dtype=torch.int64, device=self.device,
+        )
         self.input_ids = torch.tensor(
             input_ids_list, dtype=torch.int64, device=self.device
         )
@@ -2053,21 +2080,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = None
         self.output_ids = None
 
-        # 3. Allocate KV slots and write to req_to_token_pool
-        num_tokens = bs * block_size
-        out_cache_loc = alloc_token_slots(self.tree_cache, num_tokens)
+        # 4. Write KV slots via batched scatter
+        rpx_indices = []
+        pos_indices = []
         for i, req in enumerate(self.reqs):
             for t in range(block_size):
-                slot = out_cache_loc[i * block_size + t]
-                self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, prefix_lens[i] + t
-                ] = slot
+                rpx_indices.append(req.req_pool_idx)
+                pos_indices.append(prefix_lens[i] + t)
+        self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
+            self.req_to_token_pool.req_to_token.dtype
+        )
         self.out_cache_loc = out_cache_loc
 
-        # 4. Update per-request memory fields (set, not increment)
+        # 5. Update per-request memory fields (absolute, not incremental)
         for i, req in enumerate(self.reqs):
             req.kv_committed_len = seq_lens[i]
             req.kv_allocated_len = seq_lens[i]
+        return True
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:

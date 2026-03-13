@@ -25,89 +25,28 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
-    def _try_dllm_fast_decode(self: Scheduler) -> Optional[ScheduleBatch]:
-        """Fast path: reuse last_batch for pure DLLM decode steps.
-
-        Avoids the full get_new_batch_dllm() → init_new → prepare_for_extend
-        pipeline.  Only valid when:
-          1. No new waiting requests to schedule
-          2. All DLLM staging requests are in STAGING_DECODE phase
-          3. last_batch exists and is non-empty
-        Returns the reused batch, or None to fall back to the slow path.
-        """
-        # Must have a previous batch to reuse
-        if self.last_batch is None or self.last_batch.is_empty():
-            return None
-        if not self.last_batch.forward_mode.is_dllm_extend():
-            return None
-
-        # No new requests waiting → pure decode
-        if self.waiting_queue:
-            return None
-
-        # All staging requests must be decode (have mask tokens)
-        staging = self.dllm_manager.staging_queue
-        if not staging:
-            return None
-        if any(req.finished() for req in staging):
-            return None
-
-        # Reuse last_batch: update DLLM state + prepare lightweight decode
-        batch = self.last_batch
-        # Filter finished reqs first
-        batch.filter_batch()
-        if batch.is_empty():
-            return None
-
-        batch.prepare_for_dllm_decode()
-
-        # Keep staging queue consistent
-        self.dllm_manager.staging_queue = list(batch.reqs)
-        self.dllm_manager.waiting_queue = []
-
-        # Record prefill stats for logging
-        from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
-
-        batch.prefill_stats = PrefillStats(
-            log_input_tokens=batch.extend_num_tokens,
-            log_hit_tokens=0,
-            new_token_ratio=0,
-            running_bs=0,
-            num_new_seqs=len(batch.reqs),
-        )
-        return batch
-
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
         if self.try_preemption:
             self.running_batch.batch_is_full = False
 
-        # Early exit if batch is full or no requests available
         if self._should_skip_prefill():
             return None
 
         running_bs = len(self.running_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
-
-        # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs)
 
-        # Initialize DLLM manager and transfer requests
         self.dllm_manager.init_next_round()
         self._fetch_waiting_reqs()
 
-        # Process batches
         forward_mode = self._process_dllm_batches(adder)
-
         can_run_list = adder.can_run_list
         if not can_run_list:
             return None
 
-        # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
         self._update_state_for_batch(can_run_list, adder, running_bs)
-
-        # Create and prepare batch
         new_batch = self._create_dllm_batch(can_run_list, forward_mode)
         return new_batch
 
