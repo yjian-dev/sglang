@@ -148,7 +148,7 @@ Vary `--concurrency` for different batch sizes: 1, 4, 8, 16, 32, 48, 64.
 ## Constraints
 - Do NOT break one-shot prefill (TTFT must remain <100ms for short prompts)
 - Do NOT break CUDA graph for decode steps
-- Do NOT break correctness — generation must be fluent and correct (quality ≈ Qwen3-8B)
+- Do NOT break correctness — generation must be fluent and correct (quality ≈ Qwen3-8B, must use some math medium problem to test correctness such as gsm8k)
 - Prefer minimal, targeted changes over large refactors
 - Always update PLAN.md with progress after each iteration
 - **When hitting a performance wall or unexpected behavior: profile first, then fix.** Use server-side torch profiler and parse traces with Python to identify the bottleneck quantitatively before attempting a fix.

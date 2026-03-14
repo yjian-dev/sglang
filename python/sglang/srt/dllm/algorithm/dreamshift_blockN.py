@@ -144,6 +144,22 @@ class DreamShiftBlockN(DllmAlgorithm):
         self.use_spec_verify: bool = config.algorithm_config.get(
             "use_spec_verify", True
         )
+        # Relaxed verification: accept with prob min(1, p/(alpha*q))
+        # alpha=1.0: standard verify, alpha<1: more lenient, alpha=0: always accept
+        self.verify_alpha: float = config.algorithm_config.get(
+            "verify_alpha", 1.0
+        )
+        # Number of speculative tokens to verify (default: all = num_masks)
+        # Setting to 1 verifies only the first spec, auto-accepts the rest.
+        self.verify_num_specs: int = min(
+            config.algorithm_config.get("verify_num_specs", self.num_masks),
+            self.num_masks,
+        )
+        # Fast verify mode: use logit-based threshold instead of full p/q ratio
+        # Skips softmax computation for significant speedup
+        self.fast_verify: bool = config.algorithm_config.get("fast_verify", False)
+        # Logit threshold for fast verify: accept if logit(spec) is in top-K logits
+        self.fast_verify_topk: int = config.algorithm_config.get("fast_verify_topk", 5)
 
         # Per-request state (keyed by req_pool_idx)
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
@@ -168,7 +184,7 @@ class DreamShiftBlockN(DllmAlgorithm):
         logger.info(
             f"[DreamShiftBlockN] gen_block_size={self.gen_block_size}, "
             f"block_size={self.block_size}, num_masks={self.num_masks}, "
-            f"spec_verify={self.use_spec_verify}"
+            f"spec_verify={self.use_spec_verify}, verify_alpha={self.verify_alpha}"
         )
 
     def cleanup_request(self, req_pool_idx: int):
@@ -353,12 +369,14 @@ class DreamShiftBlockN(DllmAlgorithm):
 
         if self.use_spec_verify and verify_bids:
             nv = len(verify_bids)
+            vns = self.verify_num_specs
+
             all_gather_idx = []
             all_spec_vals = []
             all_draft_qx_vals = []
             for bid in verify_bids:
                 base = base_offsets[bid]
-                for si in range(num_masks):
+                for si in range(vns):
                     all_gather_idx.append(base + si)
                     all_spec_vals.append(old_specs[bid][si])
                     all_draft_qx_vals.append(old_draft_qx[bid][si])
@@ -366,39 +384,68 @@ class DreamShiftBlockN(DllmAlgorithm):
             all_clean_logits = full_logits[
                 torch.tensor(all_gather_idx, dtype=torch.long, device=device)
             ]
-            if self.temperature > 0 and self.temperature != 1.0:
-                all_clean_logits = all_clean_logits / self.temperature
-            all_clean_probs = F.softmax(all_clean_logits, dim=-1)
             all_spec_vals_t = torch.tensor(
                 all_spec_vals, dtype=torch.long, device=device
             )
 
-            all_p = all_clean_probs.gather(1, all_spec_vals_t.unsqueeze(1)).squeeze(1)
-            all_q = torch.tensor(
-                all_draft_qx_vals, dtype=torch.float32, device=device
-            )
-            all_ratios = torch.where(all_q > 0, all_p / all_q, torch.zeros_like(all_p))
-            all_rands = torch.rand(nv * num_masks, device=device)
-            all_accepted = (all_ratios >= 1.0) | (all_rands < all_ratios)
+            if self.fast_verify:
+                # Fast verify: accept if spec token is in top-K logits
+                # No softmax needed — just compare logit ranks
+                spec_logit_vals = all_clean_logits.gather(
+                    1, all_spec_vals_t.unsqueeze(1)
+                ).squeeze(1)
+                topk_vals, _ = all_clean_logits.topk(
+                    self.fast_verify_topk, dim=-1
+                )
+                topk_thresholds = topk_vals[:, -1]
+                all_accepted = spec_logit_vals >= topk_thresholds
+                # Correction: argmax (no softmax/multinomial)
+                all_corr_tokens = all_clean_logits.argmax(dim=-1)
+            else:
+                # Standard verify: full p/q ratio with softmax
+                if self.temperature > 0 and self.temperature != 1.0:
+                    all_clean_logits = all_clean_logits / self.temperature
+                all_clean_probs = F.softmax(all_clean_logits, dim=-1)
 
-            all_accepted_cpu = all_accepted.tolist()
+                all_p = all_clean_probs.gather(
+                    1, all_spec_vals_t.unsqueeze(1)
+                ).squeeze(1)
+                all_q = torch.tensor(
+                    all_draft_qx_vals, dtype=torch.float32, device=device
+                )
+                alpha = self.verify_alpha
+                if alpha <= 0:
+                    all_accepted = torch.ones(
+                        nv * vns, dtype=torch.bool, device=device
+                    )
+                else:
+                    scaled_q = all_q * alpha
+                    all_ratios = torch.where(
+                        scaled_q > 0, all_p / scaled_q,
+                        torch.zeros_like(all_p),
+                    )
+                    all_rands = torch.rand(nv * vns, device=device)
+                    all_accepted = (all_ratios >= 1.0) | (
+                        all_rands < all_ratios
+                    )
+                # Pre-sample corrections
+                all_corr_tokens = torch.multinomial(
+                    all_clean_probs, num_samples=1
+                ).squeeze(1)
 
-            reject_indices = []
+            # Single GPU→CPU sync for acceptance + corrections
+            _packed = torch.cat([all_accepted.to(torch.int32), all_corr_tokens])
+            _packed_cpu = _packed.tolist()
+            all_accepted_cpu = _packed_cpu[:nv * vns]
+            all_corr_cpu = _packed_cpu[nv * vns:]
+
             for k, bid in enumerate(verify_bids):
-                base_k = k * num_masks
-                for si in range(num_masks):
+                base_k = k * vns
+                for si in range(vns):
                     if not all_accepted_cpu[base_k + si]:
                         reject_at[bid] = si
-                        reject_indices.append((bid, si, base_k + si))
+                        corrected[bid] = all_corr_cpu[base_k + si]
                         break
-
-            if reject_indices:
-                corr_indices = [idx for _, _, idx in reject_indices]
-                corr_probs = all_clean_probs[corr_indices]
-                corr_tokens = torch.multinomial(corr_probs, num_samples=1).squeeze(1)
-                corr_tokens_cpu = corr_tokens.tolist()
-                for i, (bid, si, idx) in enumerate(reject_indices):
-                    corrected[bid] = corr_tokens_cpu[i]
 
         # ── Step 2: Batched sampling (decode requests only) ────────
         accepted_verify_bids = [
