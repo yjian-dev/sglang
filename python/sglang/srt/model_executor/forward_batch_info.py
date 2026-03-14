@@ -465,7 +465,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return ret
 
         # Override the positions with diffusion LLM or spec_info
-        if batch.dllm_config is not None:
+        # Skip DLLM position override during prefill (variable token count);
+        # the standard extend path computes correct positions.
+        dllm_is_prefill = batch.dllm_config is not None and any(
+            r.is_dllm_prefill() for r in batch.reqs
+        )
+        if batch.dllm_config is not None and not dllm_is_prefill:
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() else torch.int32

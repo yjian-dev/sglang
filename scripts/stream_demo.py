@@ -7,7 +7,7 @@ import time
 import requests
 
 
-def stream_chat(url, prompt, max_tokens=1024, temperature=1.0, top_k=50, top_p=0.95):
+def stream_chat(url, prompt, max_tokens=1024, temperature=1.0, top_k=50, top_p=0.95, ignore_eos=False):
     t0 = time.time()
     first_token_time = None
     token_count = 0
@@ -21,6 +21,7 @@ def stream_chat(url, prompt, max_tokens=1024, temperature=1.0, top_k=50, top_p=0
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
+            "ignore_eos": ignore_eos,
             "stream": True,
             "stream_options": {"include_usage": True},
         },
@@ -68,11 +69,12 @@ def main():
     parser.add_argument("--url", default="http://localhost:30000")
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--ignore-eos", action="store_true", help="Do not stop at EOS")
     args = parser.parse_args()
 
     prompt = args.prompt or "请用中文详细解释什么是机器学习，包括其主要类型和应用场景。"
     print(f"Prompt: {prompt}\n{'='*60}\n")
-    stream_chat(args.url, prompt, max_tokens=args.max_tokens)
+    stream_chat(args.url, prompt, max_tokens=args.max_tokens, ignore_eos=args.ignore_eos)
 
 
 if __name__ == "__main__":

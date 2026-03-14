@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1100,24 +1101,98 @@ class Scheduler(
                 )
 
     @DynamicGradMode()
+    def _inline_absorb_new_requests(self, batch):
+        """Absorb new requests into the decode batch WITHOUT a separate forward pass.
+
+        New requests are added to batch.reqs and marked as pending prefill.
+        prepare_for_dllm_decode handles mixed decode+prefill batches, and
+        the algorithm detects prefill requests (no MASKs) to handle them
+        differently (save last logits only, no output tokens).
+        """
+        if not self.waiting_queue:
+            return
+
+        max_reqs = self.dllm_config.max_running_requests
+        current_bs = len(batch.reqs)
+        capacity = max_reqs - current_bs
+        if capacity <= 0:
+            return
+
+        # Limit by token count to avoid OOM from large logits buffers
+        max_absorb_tokens = 4096
+        est_tokens_per_req = 300
+        max_absorb_by_tokens = max(1, max_absorb_tokens // est_tokens_per_req)
+        # Also limit by available req pool slots (leave headroom for outer scheduler)
+        req_pool_avail = self.req_to_token_pool.available_size()
+        num_to_add = min(capacity, len(self.waiting_queue), max_absorb_by_tokens, req_pool_avail)
+        new_reqs = self.waiting_queue[:num_to_add]
+        self.waiting_queue = self.waiting_queue[num_to_add:]
+
+        # Allocate req_pool_idx for new requests
+        try:
+            req_pool_indices = self.req_to_token_pool.alloc(new_reqs)
+        except Exception:
+            self.waiting_queue = list(new_reqs) + self.waiting_queue
+            return
+        if req_pool_indices is None:
+            self.waiting_queue = list(new_reqs) + self.waiting_queue
+            return
+
+        # Initialize and add directly to batch — no separate forward pass.
+        # prepare_for_dllm_decode will include their prompt tokens in the
+        # next decode forward, and the algorithm will handle them as prefill.
+        absorbed = 0
+        for i, req in enumerate(new_reqs):
+            req.req_pool_idx = req_pool_indices[i]
+            req.init_next_round_input(self.tree_cache)
+            prefix_len = len(req.prefix_indices)
+            origin_remaining = len(req.origin_input_ids) - prefix_len
+            if origin_remaining <= 0:
+                req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                req.dllm_next_advance = len(req.origin_input_ids)
+            # Mark as pending inline prefill — prepare_for_dllm_decode
+            # will use origin_input_ids instead of MASK tokens
+            req._inline_prefill = req.is_dllm_prefill()
+            batch.reqs.append(req)
+            absorbed += 1
+
+        if absorbed > 0:
+            if batch.multimodal_inputs is not None:
+                batch.multimodal_inputs.extend([None] * absorbed)
+            from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+            batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                batch, self.model_config.vocab_size
+            )
+            self.dllm_manager.staging_queue = [
+                r for r in batch.reqs if not r.finished()
+            ]
+
     def _dllm_decode_loop(self, initial_batch):
         """DLLM decode-mode inner loop: reuse batch with prepare_for_dllm_decode."""
         steps = 0
         exit_reason = "unknown"
         batch = initial_batch
         batch._dllm_decode_mode = True
+        # Timing accumulators (ms)
+        _t_prep = 0.0
+        _t_forward = 0.0
+        _t_process = 0.0
+        _t_sched = 0.0
+        _t_recv = 0.0
+        _t_filter = 0.0
+        _t_absorb = 0.0
+        _n_absorb = 0
 
         try:
             while True:
+                _t0 = time.perf_counter()
                 recv_reqs = self.recv_requests()
                 if recv_reqs:
                     self.process_input_requests(recv_reqs)
+                _ta = time.perf_counter()
+                _t_recv += (_ta - _t0)
 
-                if self.waiting_queue:
-                    exit_reason = "new_requests"
-                    break
-
-                # Handle finished requests in-place
+                # Handle finished requests FIRST (batch tensors still consistent)
                 if any(r.finished() for r in batch.reqs):
                     self.dllm_manager.staging_queue = [
                         r for r in self.dllm_manager.staging_queue
@@ -1128,16 +1203,38 @@ class Scheduler(
                     if batch.is_empty():
                         exit_reason = "all_finished"
                         break
+                _tb = time.perf_counter()
+                _t_filter += (_tb - _ta)
+
+                # Inline absorb new requests AFTER filter
+                # (prepare_for_dllm_decode rebuilds all tensors from scratch)
+                if self.waiting_queue:
+                    self._inline_absorb_new_requests(batch)
+                    _n_absorb += 1
+                    # Don't exit when batch is full — keep decoding until
+                    # requests finish, then absorb. Exiting causes the outer
+                    # scheduler to re-prefill all requests from scratch
+                    # (ChunkCache has no prefix matching).
+                _tc = time.perf_counter()
+                _t_absorb += (_tc - _tb)
+                _t1 = _tc
+                _t_sched += (_t1 - _t0)
 
                 # Lightweight batch prep
                 success = batch.prepare_for_dllm_decode()
                 if not success:
                     exit_reason = "alloc_failed"
                     break
+                _t2 = time.perf_counter()
+                _t_prep += (_t2 - _t1)
 
                 self.cur_batch = batch
                 result = self.run_batch(batch)
+                _t3 = time.perf_counter()
+                _t_forward += (_t3 - _t2)
                 self.process_batch_result(batch, result)
+                _t4 = time.perf_counter()
+                _t_process += (_t4 - _t3)
 
                 self.dllm_manager.staging_queue = [
                     r for r in batch.reqs if not r.finished()
@@ -1151,8 +1248,28 @@ class Scheduler(
             traceback.print_exc()
 
         batch._dllm_decode_mode = False
+
+        # Ensure all unfinished batch requests are in dllm_manager.waiting_queue
+        # so the outer scheduler can re-schedule them. Inline-absorbed requests
+        # bypass _fetch_waiting_reqs and need to be registered here.
+        existing_rids = {r.rid for r in self.dllm_manager.waiting_queue}
+        for req in batch.reqs:
+            if not req.finished() and req.rid not in existing_rids:
+                self.dllm_manager.waiting_queue.append(req)
+
         if steps > 0:
-            logger.info(f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}")
+            total_t = _t_sched + _t_prep + _t_forward + _t_process
+            logger.info(
+                f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}, "
+                f"total={total_t*1000:.0f}ms "
+                f"(sched={_t_sched/total_t*100:.0f}% "
+                f"[recv={_t_recv*1000:.0f}ms filter={_t_filter*1000:.0f}ms "
+                f"absorb={_t_absorb*1000:.0f}ms/{_n_absorb}calls] "
+                f"prep={_t_prep/total_t*100:.0f}% "
+                f"fwd={_t_forward/total_t*100:.0f}% "
+                f"proc={_t_process/total_t*100:.0f}%) "
+                f"step={total_t/steps*1000:.1f}ms"
+            )
 
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1173,10 +1290,11 @@ class Scheduler(
                 self.process_batch_result(batch, result)
 
                 # DLLM: enter fast decode loop after first decode step
-                # (not after prefill — prefill doesn't set dllm_next_advance)
+                # (not after prefill — one-shot prefill returns no tokens)
+                # Allow entry even with waiting_queue: inline absorption
+                # handles new requests inside the decode loop.
                 if (self.dllm_config is not None
                     and self.dllm_manager.any_staging_reqs()
-                    and not self.waiting_queue
                     and not any(r.finished() for r in batch.reqs)
                     and not any(r.is_dllm_prefill() for r in batch.reqs)):
                     self.last_batch = batch

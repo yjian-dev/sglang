@@ -434,7 +434,9 @@ class PrefillAdder:
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
 
-        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        self.rem_dllm_tokens = max(
+            max_running_reqs * self.dllm_block_size, self.rem_input_tokens
+        )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -539,11 +541,19 @@ class PrefillAdder:
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        if req.is_dllm_prefill():
+            origin_remaining = len(req.origin_input_ids) - prefix_len
+            trunc_len = (
+                min(self.rem_dllm_tokens, int(self.rem_total_tokens), origin_remaining)
+                // self.page_size
+                * self.page_size
+            )
+        else:
+            trunc_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
 
         req.extend_input_len = trunc_len
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
@@ -566,7 +576,11 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        max_extend = min(req.extend_input_len, _rem_tokens, self.dllm_block_size)
+        if req.is_dllm_prefill():
+            origin_remaining = len(req.origin_input_ids) - len(req.prefix_indices)
+            max_extend = min(origin_remaining, int(self.rem_total_tokens))
+        else:
+            max_extend = min(req.extend_input_len, _rem_tokens, self.dllm_block_size)
         truncated = req.extend_input_len > max_extend
         req.extend_input_len = max_extend
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -589,7 +603,11 @@ class PrefillAdder:
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
-            _rem_tokens = self._get_dllm_remain_tokens()
+            if req.is_dllm_prefill():
+                origin_remaining = len(req.origin_input_ids) - len(req.prefix_indices)
+                _rem_tokens = min(origin_remaining, int(self.rem_total_tokens))
+            else:
+                _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.

@@ -638,12 +638,22 @@ class CudaGraphRunner:
             else True
         )
 
+        is_dllm_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.is_dllm
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dllm_supported
         )
 
     def _init_profile_context_and_memory_record(self):

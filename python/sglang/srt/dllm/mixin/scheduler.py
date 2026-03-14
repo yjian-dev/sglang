@@ -55,7 +55,9 @@ class SchedulerDllmMixin:
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
             self.dllm_manager.waiting_queue
         )
-        num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
+        # Also limit by available req pool slots (staging reqs already hold slots)
+        req_pool_avail = self.req_to_token_pool.available_size()
+        num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue), req_pool_avail)
 
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
@@ -220,7 +222,6 @@ class SchedulerDllmMixin:
                 has_chunked_req=True,
                 truncation_align_size=self.truncation_align_size,
             )
-
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.running_batch.batch_is_full = True

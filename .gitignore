@@ -1,3 +1,7 @@
+# Benchmark results and logs
+bench_results/
+server_*.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

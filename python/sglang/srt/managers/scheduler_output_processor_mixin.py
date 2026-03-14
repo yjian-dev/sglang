@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
@@ -378,8 +379,20 @@ class SchedulerOutputProcessorMixin:
         )
 
         if not result.next_token_ids:
+            # Pure prefill batch (no decode requests)
             for req in batch.reqs:
                 self.tree_cache.cache_unfinished_req(req)
+                if req.is_dllm() and req.is_dllm_prefill():
+                    origin_len = len(req.origin_input_ids)
+                    cached_len = (
+                        len(req.prefix_indices)
+                        if req.prefix_indices is not None
+                        else 0
+                    )
+                    if cached_len >= origin_len:
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        req.dllm_next_advance = origin_len
+                        req._inline_prefill = False
 
         # Batch KV free: collect GPU tensor slices directly (no CPU round-trip)
         kv_gpu_parts = []
@@ -393,7 +406,6 @@ class SchedulerOutputProcessorMixin:
                 if gpu_indices is not None:
                     kv_gpu_parts.append(gpu_indices)
                 else:
-                    # Fallback for legacy CPU list format
                     cpu_indices = trim_info.get("kv_indices")
                     if cpu_indices:
                         kv_cpu_parts.extend(cpu_indices)
@@ -412,6 +424,27 @@ class SchedulerOutputProcessorMixin:
             req = batch.reqs[idx]
             raw = result.next_token_ids[idx]
             next_token_ids = raw if isinstance(raw, list) else raw.tolist()
+
+            # Handle inline prefill requests in mixed batch:
+            # Force-treat _inline_prefill requests as pure prefill regardless
+            # of what the algorithm returned (it may not know about inline prefill).
+            is_inline_pf = getattr(req, '_inline_prefill', False)
+            if not next_token_ids or is_inline_pf:
+                self.tree_cache.cache_unfinished_req(req)
+                # Transition prefill → decode
+                if req.is_dllm() and (req.is_dllm_prefill() or is_inline_pf):
+                    origin_len = len(req.origin_input_ids)
+                    cached_len = (
+                        len(req.prefix_indices)
+                        if req.prefix_indices is not None
+                        else 0
+                    )
+                    if cached_len >= origin_len:
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        req.dllm_next_advance = origin_len
+                        req._inline_prefill = False
+                continue
+
             self.num_generated_tokens += len(next_token_ids)
 
             req_pool_idx = req.req_pool_idx
@@ -433,7 +466,6 @@ class SchedulerOutputProcessorMixin:
                         write_start : write_start + len(next_token_ids)
                     ] = next_token_ids
 
-            # Handle KV trim accounting (actual free done in batch above)
             trim_info = kv_trim_info.pop(req_pool_idx, None)
             if trim_info is not None:
                 trim_count = trim_info["trim_count"]
@@ -454,8 +486,6 @@ class SchedulerOutputProcessorMixin:
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
-                    # Clean up algorithm per-request state to prevent stale
-                    # data when req_pool_idx is recycled by a new request.
                     if dllm_algo is not None:
                         dllm_algo.cleanup_request(req_pool_idx)
                     finished = True
