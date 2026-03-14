@@ -491,7 +491,11 @@ class SchedulerOutputProcessorMixin:
                     finished = True
                     break
             if not finished:
-                self.tree_cache.cache_unfinished_req(req)
+                # In fast decode loop, skip expensive cache_unfinished_req
+                # (GPU tensor copy per req). prepare_for_dllm_decode uses
+                # kv_committed_len instead of prefix_indices for decode reqs.
+                if not getattr(batch, '_dllm_decode_mode', False) or is_inline_pf:
+                    self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

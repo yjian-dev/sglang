@@ -2070,7 +2070,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Decode: normal path — appends MASKs
                 req.init_next_round_input()
                 req.extend_input_len = min(req.extend_input_len, block_size)
-                prefix_len = len(req.prefix_indices)
+                # Use kv_committed_len when available (avoids GPU tensor read
+                # from prefix_indices during fast decode loop)
+                prefix_len = getattr(req, 'kv_committed_len', None) or len(req.prefix_indices)
                 req.fill_ids = req.fill_ids[:prefix_len + req.extend_input_len]
 
             input_ids_list.extend(req.fill_ids[prefix_len:])
@@ -2097,17 +2099,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = None
         self.output_ids = None
 
-        # 5. Write KV slots via batched scatter
-        rpx_indices = []
-        pos_indices = []
-        slot_offset = 0
+        # 5. Write KV slots via batched scatter (pre-allocated lists)
+        rpx_indices = [0] * num_tokens
+        pos_indices = [0] * num_tokens
+        offset = 0
         for i in range(bs):
             rpx = rpx_list[i]
             pl = prefix_lens[i]
             ext = extend_lens[i]
             for t in range(ext):
-                rpx_indices.append(rpx)
-                pos_indices.append(pl + t)
+                rpx_indices[offset] = rpx
+                pos_indices[offset] = pl + t
+                offset += 1
         self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
             self.req_to_token_pool.req_to_token.dtype
         )

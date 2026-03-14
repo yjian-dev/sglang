@@ -1249,6 +1249,12 @@ class Scheduler(
 
         batch._dllm_decode_mode = False
 
+        # Flush cache_unfinished_req for all unfinished requests — skipped
+        # during the fast decode loop to avoid GPU tensor copies per step.
+        for req in batch.reqs:
+            if not req.finished():
+                self.tree_cache.cache_unfinished_req(req)
+
         # Ensure all unfinished batch requests are in dllm_manager.waiting_queue
         # so the outer scheduler can re-schedule them. Inline-absorbed requests
         # bypass _fetch_waiting_reqs and need to be registered here.
