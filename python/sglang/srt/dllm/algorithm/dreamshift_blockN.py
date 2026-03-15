@@ -165,6 +165,12 @@ class DreamShiftBlockN(DllmAlgorithm):
         self.fast_verify_topk_per_spec: List[int] = config.algorithm_config.get(
             "fast_verify_topk_per_spec", []
         )
+        # Output correction: when a spec token is accepted (in top-K) but isn't the
+        # clean argmax, replace the OUTPUT token with the argmax for higher quality.
+        # KV cache retains the original spec token (small mismatch, usually negligible).
+        self.output_correction: bool = config.algorithm_config.get(
+            "output_correction", False
+        )
 
         # Per-request state (keyed by req_pool_idx)
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
@@ -371,6 +377,7 @@ class DreamShiftBlockN(DllmAlgorithm):
 
         reject_at = {}       # bid -> rejected spec index
         corrected = {}       # bid -> corrected token id
+        spec_corrections = {}  # bid -> list of corrected tokens per spec (output correction mode)
 
         if self.use_spec_verify and verify_bids:
             nv = len(verify_bids)
@@ -425,35 +432,41 @@ class DreamShiftBlockN(DllmAlgorithm):
                 all_corr_tokens = all_clean_logits.argmax(dim=-1)
             else:
                 # Standard verify: full p/q ratio with softmax
-                if self.temperature > 0 and self.temperature != 1.0:
-                    all_clean_logits = all_clean_logits / self.temperature
-                all_clean_probs = F.softmax(all_clean_logits, dim=-1)
-
-                all_p = all_clean_probs.gather(
-                    1, all_spec_vals_t.unsqueeze(1)
-                ).squeeze(1)
-                all_q = torch.tensor(
-                    all_draft_qx_vals, dtype=torch.float32, device=device
-                )
-                alpha = self.verify_alpha
-                if alpha <= 0:
-                    all_accepted = torch.ones(
-                        nv * vns, dtype=torch.bool, device=device
-                    )
+                if self.temperature <= 0:
+                    # Greedy: deterministic accept (spec == argmax) + argmax correction
+                    # Avoids softmax + multinomial for speed
+                    all_corr_tokens = all_clean_logits.argmax(dim=-1)
+                    all_accepted = all_spec_vals_t == all_corr_tokens
                 else:
-                    scaled_q = all_q * alpha
-                    all_ratios = torch.where(
-                        scaled_q > 0, all_p / scaled_q,
-                        torch.zeros_like(all_p),
+                    if self.temperature != 1.0:
+                        all_clean_logits = all_clean_logits / self.temperature
+                    all_clean_probs = F.softmax(all_clean_logits, dim=-1)
+
+                    all_p = all_clean_probs.gather(
+                        1, all_spec_vals_t.unsqueeze(1)
+                    ).squeeze(1)
+                    all_q = torch.tensor(
+                        all_draft_qx_vals, dtype=torch.float32, device=device
                     )
-                    all_rands = torch.rand(nv * vns, device=device)
-                    all_accepted = (all_ratios >= 1.0) | (
-                        all_rands < all_ratios
-                    )
-                # Pre-sample corrections
-                all_corr_tokens = torch.multinomial(
-                    all_clean_probs, num_samples=1
-                ).squeeze(1)
+                    alpha = self.verify_alpha
+                    if alpha <= 0:
+                        all_accepted = torch.ones(
+                            nv * vns, dtype=torch.bool, device=device
+                        )
+                    else:
+                        scaled_q = all_q * alpha
+                        all_ratios = torch.where(
+                            scaled_q > 0, all_p / scaled_q,
+                            torch.zeros_like(all_p),
+                        )
+                        all_rands = torch.rand(nv * vns, device=device)
+                        all_accepted = (all_ratios >= 1.0) | (
+                            all_rands < all_ratios
+                        )
+                    # Pre-sample corrections
+                    all_corr_tokens = torch.multinomial(
+                        all_clean_probs, num_samples=1
+                    ).squeeze(1)
 
             # Single GPU→CPU sync for acceptance + corrections
             _packed = torch.cat([all_accepted.to(torch.int32), all_corr_tokens])
@@ -468,6 +481,11 @@ class DreamShiftBlockN(DllmAlgorithm):
                         reject_at[bid] = si
                         corrected[bid] = all_corr_cpu[base_k + si]
                         break
+                # Store per-spec corrections for output correction mode
+                if self.output_correction:
+                    spec_corrections[bid] = [
+                        all_corr_cpu[base_k + si] for si in range(vns)
+                    ]
 
         # ── Step 2: Batched sampling (decode requests only) ────────
         accepted_verify_bids = [
@@ -586,8 +604,14 @@ class DreamShiftBlockN(DllmAlgorithm):
                 si = reject_at[bid]
                 specs = old_specs[bid]
                 ct = corrected[bid]
-                output_tokens = list(specs[:si]) + [ct]
-                dllm_tokens = [t0_tokens[bid]] + list(specs[:si]) + [ct]
+                # Output correction: replace accepted specs before rejection with clean argmax
+                if bid in spec_corrections:
+                    corr = spec_corrections[bid]
+                    out_pre = [corr[j] if j < len(corr) else specs[j] for j in range(si)]
+                else:
+                    out_pre = list(specs[:si])
+                output_tokens = out_pre + [ct]
+                dllm_tokens = [t0_tokens[bid]] + out_pre + [ct]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._force_next_token[rpx] = ct
                 self._prev_last_logits[rpx] = _saved_logits[bid]
@@ -598,8 +622,16 @@ class DreamShiftBlockN(DllmAlgorithm):
                 sr = sampled_results[bid]
                 clean_token = sr[0]
                 new_spec_tokens = sr[1:]
-                output_tokens = list(specs) + [clean_token]
-                dllm_tokens = [t0_tokens[bid]] + list(specs) + [clean_token]
+                # Output correction: replace spec tokens with clean argmax for quality
+                if bid in spec_corrections:
+                    corr = spec_corrections[bid]
+                    # Replace verified specs with their clean corrections
+                    out_specs = [corr[si] if si < len(corr) else specs[si]
+                                 for si in range(len(specs))]
+                else:
+                    out_specs = list(specs)
+                output_tokens = out_specs + [clean_token]
+                dllm_tokens = [t0_tokens[bid]] + out_specs + [clean_token]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._pending[rpx] = clean_token
                 self._spec_tokens[rpx] = new_spec_tokens
