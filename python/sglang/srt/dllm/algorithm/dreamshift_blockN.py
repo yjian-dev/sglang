@@ -31,6 +31,12 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+
+try:
+    from sglang.srt.dllm.algorithm.fused_verify_kernel import fused_spec_verify
+    _HAS_FUSED_VERIFY = True
+except ImportError:
+    _HAS_FUSED_VERIFY = False
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -69,15 +75,19 @@ def _batched_sample(
     temperature: float,
     top_k: int,
     top_p: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_probs: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, ...]:
     """Batched sampling from [N, vocab_size] logits on GPU.
 
-    Returns (token_ids [N], probs [N]) — both stay on GPU, no .item() sync.
+    Returns (token_ids [N], token_probs [N]) — both stay on GPU, no .item() sync.
+    If return_probs=True, also returns the full probs [N, vocab_size] matrix.
     """
     if temperature <= 0:
         probs = F.softmax(logits, dim=-1)
         token_ids = probs.argmax(dim=-1)
         token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        if return_probs:
+            return token_ids, token_probs, probs
         return token_ids, token_probs
 
     scaled = logits if temperature == 1.0 else logits / temperature
@@ -90,6 +100,8 @@ def _batched_sample(
             probs.contiguous(), top_ks, top_ps, filter_apply_order="joint"
         )
         token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        if return_probs:
+            return token_ids, token_probs, probs
         return token_ids, token_probs
 
     # Fallback: manual implementation
@@ -105,6 +117,8 @@ def _batched_sample(
     probs = F.softmax(scaled, dim=-1)
     token_ids = torch.multinomial(probs, num_samples=1).squeeze(1)
     token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+    if return_probs:
+        return token_ids, token_probs, probs
     return token_ids, token_probs
 
 
@@ -181,6 +195,11 @@ class DreamShiftBlockN(DllmAlgorithm):
         # Each entry is a list of GPU tensors of shape [vocab_size], one per spec token.
         self._spec_draft_probs: Dict[int, List[torch.Tensor]] = {}
         self._force_next_token: Dict[int, int] = {}
+        # Pre-allocated draft probs buffer: [max_slots, vocab_size] indexed by rpx
+        # Lazily initialized on first use. Eliminates torch.stack overhead.
+        self._draft_probs_buf: torch.Tensor = None  # [max_slots, vocab_size]
+        self._draft_probs_buf_rpx: set = set()  # track which rpx slots are valid
+        self._gumbel_seed_counter: int = 0  # incrementing seed for Gumbel RNG
 
         # Per-round signals to the output processor
         self._dllm_write_override: Dict[int, List[int]] = {}
@@ -374,6 +393,7 @@ class DreamShiftBlockN(DllmAlgorithm):
         logits_output = out.logits_output
         full_logits = logits_output.full_logits
         if self._timing_enabled:
+            torch.cuda.synchronize()  # For accurate phase timing (only when profiling)
             _t_phase2_end = time.perf_counter()
 
         # Phase 3: Batched post-forward — verify + sample + trim
@@ -480,6 +500,16 @@ class DreamShiftBlockN(DllmAlgorithm):
             elif self.temperature <= 0:
                 all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
                 all_accepted_gpu = all_spec_vals_t == all_corr_tokens_gpu
+            elif _HAS_FUSED_VERIFY and self.verify_alpha > 0:
+                # Fused Triton kernel: softmax + ratio + Gumbel-max correction
+                all_draft_probs_t = torch.stack(all_draft_prob_list)
+                self._gumbel_seed_counter += 1
+                all_accepted_gpu, all_corr_tokens_gpu = fused_spec_verify(
+                    all_clean_logits, all_draft_probs_t, all_spec_vals_t,
+                    temperature=self.temperature,
+                    alpha=self.verify_alpha,
+                    gumbel_seed=self._gumbel_seed_counter,
+                )
             else:
                 # Standard verify: softmax + p/q ratio + correction
                 if self.temperature != 1.0:
