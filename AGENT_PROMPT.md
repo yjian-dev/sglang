@@ -144,6 +144,7 @@ Vary `--concurrency` for different batch sizes: 1, 4, 8, 16, 32, 48, 64.
 - Model: `/data/cxu/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_backup32000`
 - Configs: `dreamshift_blockN2_config.yaml` (N=2), `dreamshift_blockN3_config.yaml` (N=3), `dreamshift_blockN4_config.yaml` (N=4), `dreamshift_blockN5_config.yaml` (N=5)
 - Baselines: Qwen3-8B on port 30004 (no overlap), EAGLE3 on port 30005
+- The correct implementation that has no accuracy issue is in `/data/cxu/dllm-distillation/generate.py`, this `causal_blockN_spec_verified_generate_with_shift` function matches Qwen3-8B performance
 
 ## Constraints
 - Do NOT break one-shot prefill (TTFT must remain <100ms for short prompts)
@@ -151,6 +152,7 @@ Vary `--concurrency` for different batch sizes: 1, 4, 8, 16, 32, 48, 64.
 - Do NOT break correctness — generation must be fluent and correct (quality ≈ Qwen3-8B, must use some math medium problem to test correctness such as gsm8k)
 - Prefer minimal, targeted changes over large refactors
 - Always update PLAN.md with progress after each iteration
+- Always reference to `causal_blockN_spec_verified_generate_with_shift` when the implementation goes totally wrong
 - **When hitting a performance wall or unexpected behavior: profile first, then fix.** Use server-side torch profiler and parse traces with Python to identify the bottleneck quantitatively before attempting a fix.
 
 ## Environment
