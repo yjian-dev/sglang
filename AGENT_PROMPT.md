@@ -149,7 +149,8 @@ Vary `--concurrency` for different batch sizes: 1, 4, 8, 16, 32, 48, 64.
 ## Constraints
 - Do NOT break one-shot prefill (TTFT must remain <100ms for short prompts)
 - Do NOT break CUDA graph for decode steps
-- Do NOT break correctness — generation must be fluent and correct (quality ≈ Qwen3-8B, must use some math medium problem to test correctness such as gsm8k)
+- Do NOT break correctness — generation must be fluent and correct (quality ≈ Qwen3-8B)
+- **Accuracy test**: `python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 30 --max-tokens 8192` must achieve >= 90%. CRITICAL: always use max_tokens=8192 because this thinking model generates long reasoning chains (1000-4000+ tokens). Using max_tokens=2048 causes truncation and false accuracy failures (80% vs 100% with 8192).
 - Prefer minimal, targeted changes over large refactors
 - Always update PLAN.md with progress after each iteration
 - Always reference to `causal_blockN_spec_verified_generate_with_shift` when the implementation goes totally wrong

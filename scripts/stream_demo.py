@@ -7,7 +7,7 @@ import time
 import requests
 
 
-def stream_chat(url, prompt, max_tokens=1024, temperature=1.0, top_k=50, top_p=0.95, ignore_eos=False):
+def stream_chat(url, prompt, max_tokens=1024, temperature=1, top_k=50, top_p=0.95, ignore_eos=False):
     t0 = time.time()
     first_token_time = None
     token_count = 0

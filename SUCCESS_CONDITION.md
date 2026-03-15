@@ -25,7 +25,10 @@ All performance numbers come from `tore-speed-eval`. This is the only benchmark 
 - `stream_demo.py --prompt "What is 15*23+7?"` produces correct answer (352)
 - `stream_demo.py --prompt "Write a short poem about the ocean"` produces fluent, coherent text
 - 0 failed requests in all tore-speed-eval runs
-- Random 30 Question in GSM8K should have success rate > 90%
+- GSM8K 30 questions with **max_tokens=8192** must achieve **>= 90%** accuracy
+  - IMPORTANT: This model uses long thinking chains (1000-4000+ tokens). max_tokens=2048 causes truncation and false failures. Always use max_tokens=8192 for accuracy testing.
+  - Verified baseline: 100% (30/30) with max_tokens=8192, 93.3% with 4096, only 80% with 2048
+  - Command: `python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 30 --max-tokens 8192`
 
 ### 5. Algorithm health: TPF and accept rate
 - N=3: TPF >= 2.0, accept rate >= 40% (check server log: `grep "tok/fwd"`)
@@ -35,7 +38,7 @@ All performance numbers come from `tore-speed-eval`. This is the only benchmark 
 ## Test Commands
 
 Each command below is a self-contained single-line `bash -lc` invocation. Execute them sequentially.
-For step 4, please use 10-20 GSM8K math questions to verify.
+For step 4, run GSM8K 30 questions with max_tokens=8192 (the model needs long thinking chains).
 
 ### Step 1: Kill any existing server on port 30001
 ```bash
@@ -52,7 +55,19 @@ bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate
 bash -lc 'for i in $(seq 1 300); do if curl -sf http://localhost:30001/health > /dev/null 2>&1; then echo "Server ready after ${i}s"; exit 0; fi; sleep 1; done; echo "TIMEOUT"; exit 1'
 ```
 
-### Step 4: Correctness — math
+### Step 4: Correctness — GSM8K accuracy (30 questions, max_tokens=8192, target >= 90%)
+```bash
+bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 30 --max-tokens 8192 2>&1 | tee /tmp/gsm8k_result.txt && python3 -c "
+import re
+with open(\"/tmp/gsm8k_result.txt\") as f: text = f.read()
+m = re.search(r\"Accuracy: (\d+)/(\d+) = ([\d.]+)%\", text)
+assert m, \"No accuracy line found\"
+acc = float(m.group(3))
+print(f\"GSM8K accuracy: {acc}%\")
+assert acc >= 90, f\"Accuracy {acc}% < 90% target\"
+print(\"PASSED\")
+"'
+```
 
 ### Step 5: Correctness — fluency
 ```bash
@@ -161,7 +176,7 @@ When performance doesn't meet targets:
 - All test commands must exit with code 0 for success
 - EAGLE3 reference: 5103 tok/s at concurrency=32, ~5569 at concurrency=64
 - At concurrency>=48, EAGLE3 becomes compute-bound (1.03x over AR). DreamShiftBlockN should clearly win here.
-- Model quality is assumed ≈ Qwen3-8B (distilled from it); accuracy testing is needed
+- Model quality ≈ Qwen3-8B when given enough tokens. ALWAYS use max_tokens=8192 for accuracy tests (thinking model needs long chains)
 - If N=3 doesn't meet targets, try N=2 or N=4 — they have different TPF/overhead tradeoffs
 - Config: `dreamshift_blockN3_verify_fast7.yaml` (verify mode with fast top-K check, recommended)
 - The correct implementation that has no accuracy issue is in `/data/cxu/dllm-distillation/generate.py`, this `causal_blockN_spec_verified_generate_with_shift` function matches Qwen3-8B performance

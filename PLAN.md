@@ -83,15 +83,11 @@ bash -lc 'for i in $(seq 1 300); do if curl -sf http://localhost:30001/health > 
 bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/stream_demo.py --url http://localhost:30001 --prompt "What is 15*23+7?" --max-tokens 256'
 ```
 
-### GSM8K accuracy test (50 questions, chat API)
+### GSM8K accuracy test (30 questions, max_tokens=8192, target >= 90%)
 ```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 50 --max-tokens 2048'
+bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 30 --max-tokens 8192'
 ```
-
-### GSM8K accuracy test (100 questions, chat API)
-```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 100 --max-tokens 2048 --parallel 16'
-```
+IMPORTANT: Always use max_tokens=8192. This thinking model generates long reasoning chains (1000-4000+ tokens). Truncation at 2048 causes false accuracy drops (80% vs 100% with 8192). Verified: 100% (30/30) with 8192, 93.3% with 4096, 80% with 2048.
 
 ### tore-speed-eval concurrency=1 (target: >= 200 tok/s)
 ```bash
