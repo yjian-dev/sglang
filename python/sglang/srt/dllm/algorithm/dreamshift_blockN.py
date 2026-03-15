@@ -24,6 +24,7 @@ Config keys (passed via --dllm-algorithm-config YAML):
 """
 
 import logging
+import time
 from typing import Dict, List, Tuple, Union
 
 import torch
@@ -192,6 +193,14 @@ class DreamShiftBlockN(DllmAlgorithm):
             "accept_count": 0,
             "reject_count": 0,
         }
+        self._timing = {
+            "phase1_classify": 0.0,
+            "phase2_forward": 0.0,
+            "phase3_verify_sample": 0.0,
+            "phase4_trim_assemble": 0.0,
+            "timing_count": 0,
+        }
+        self._timing_enabled = False  # Set True for profiling
         logger.info(
             f"[DreamShiftBlockN] gen_block_size={self.gen_block_size}, "
             f"block_size={self.block_size}, num_masks={self.num_masks}, "
@@ -217,6 +226,8 @@ class DreamShiftBlockN(DllmAlgorithm):
         forward_batch: ForwardBatch,
         overlap_fn=None,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+        if self._timing_enabled:
+            _t_run_start = time.perf_counter()
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
         blk = self.block_size  # 2*N - 1
@@ -240,7 +251,7 @@ class DreamShiftBlockN(DllmAlgorithm):
         # Detect inline prefill requests (extend_len != blk)
         is_prefill = [extend_lens_cpu[bid] != blk for bid in range(batch_size)]
 
-        # Determine if batch has any MASK tokens (decode vs prefill) — one GPU op
+        # Determine if batch has any MASK tokens (decode vs prefill)
         # Combine req_pool_indices and seq_lens into a single tolist() to reduce GPU→CPU syncs
         _combined = torch.cat([
             forward_batch.req_pool_indices[:batch_size],
@@ -249,7 +260,12 @@ class DreamShiftBlockN(DllmAlgorithm):
         _combined_cpu = _combined.tolist()
         req_pool_indices_cpu = _combined_cpu[:batch_size]
         seq_lens_cpu = [int(x) for x in _combined_cpu[batch_size:]]
-        has_any_decode = (forward_batch.input_ids == self.mask_id).any().item()
+        # In decode loop, extend_lens contain blk-sized entries (decode requests)
+        # which always have MASKs. Skip the GPU sync for mask check.
+        if any(el == blk for el in extend_lens_cpu):
+            has_any_decode = True
+        else:
+            has_any_decode = (forward_batch.input_ids == self.mask_id).any().item()
 
         # ── Pure prefill ──────────────────────────────────────────────
         if not has_any_decode:
@@ -342,6 +358,9 @@ class DreamShiftBlockN(DllmAlgorithm):
                 forward_batch.input_ids[base_offsets[bid]] = tok
                 t0_tokens[bid] = tok
 
+        if self._timing_enabled:
+            _t_phase1_end = time.perf_counter()
+
         # Phase 2: Forward (GPU async — returns before GPU finishes)
         forward_batch.dllm_force_causal = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
@@ -354,6 +373,8 @@ class DreamShiftBlockN(DllmAlgorithm):
         # Phase 3 starts here — first access to full_logits blocks until GPU done
         logits_output = out.logits_output
         full_logits = logits_output.full_logits
+        if self._timing_enabled:
+            _t_phase2_end = time.perf_counter()
 
         # Phase 3: Batched post-forward — verify + sample + trim
         # seq_lens_cpu already computed above (combined tolist with req_pool_indices)
@@ -379,21 +400,43 @@ class DreamShiftBlockN(DllmAlgorithm):
                 rpx = req_pool_indices_cpu[bid]
                 self._prev_last_logits[rpx] = prefill_logits[k]
 
-        # ── Step 1: Batched spec verification (decode only) ────────
+        # ── Steps 1+2: Verify + sample (all GPU work, then single CPU sync) ──
         verify_bids = [bid for bid in decode_bids if case_types[bid] == 'V']
         cold_bids = [bid for bid in decode_bids if case_types[bid] == 'C']
 
         reject_at = {}       # bid -> rejected spec index
         corrected = {}       # bid -> corrected token id
         spec_corrections = {}  # bid -> list of corrected tokens per spec (output correction mode)
+        gs = 1 + num_masks
+        nv = 0
+        vns = self.verify_num_specs
+
+        # Build speculative sampling indices for ALL verify + cold bids
+        sample_logit_indices = []
+        sample_bid_roles = []
+        for bid in verify_bids:
+            n_specs = len(old_specs[bid])
+            clean_idx = base_offsets[bid] + n_specs
+            for j in range(gs):
+                sample_logit_indices.append(clean_idx + j)
+            sample_bid_roles.append(bid)
+        for bid in cold_bids:
+            base = base_offsets[bid]
+            for j in range(gs):
+                sample_logit_indices.append(base + j)
+            sample_bid_roles.append(bid)
+
+        # --- All GPU work: verify + correction + sample ---
+        all_accepted_gpu = None
+        all_corr_tokens_gpu = None
+        all_sample_ids_gpu = None
+        draft_probs_all = None
 
         if self.use_spec_verify and verify_bids:
             nv = len(verify_bids)
-            vns = self.verify_num_specs
 
             all_gather_idx = []
             all_spec_vals = []
-            # Collect full draft probability distributions for correction
             all_draft_prob_list = []
             for bid in verify_bids:
                 base = base_offsets[bid]
@@ -410,15 +453,13 @@ class DreamShiftBlockN(DllmAlgorithm):
             )
 
             if self.fast_verify:
-                # Fast verify: accept if spec token is in top-K logits
                 spec_logit_vals = all_clean_logits.gather(
                     1, all_spec_vals_t.unsqueeze(1)
                 ).squeeze(1)
 
                 if self.fast_verify_topk_per_spec and vns > 1:
-                    # Tiered verification: different topk per spec position
                     per_spec_topk = self.fast_verify_topk_per_spec
-                    all_accepted = torch.zeros(nv * vns, dtype=torch.bool, device=device)
+                    all_accepted_gpu = torch.zeros(nv * vns, dtype=torch.bool, device=device)
                     for si in range(vns):
                         k = per_spec_topk[si] if si < len(per_spec_topk) else self.fast_verify_topk
                         si_indices = list(range(si, nv * vns, vns))
@@ -428,70 +469,100 @@ class DreamShiftBlockN(DllmAlgorithm):
                         thresholds_si = topk_vals_si[:, -1]
                         accepted_si = si_spec_vals >= thresholds_si
                         for j, idx in enumerate(si_indices):
-                            all_accepted[idx] = accepted_si[j]
+                            all_accepted_gpu[idx] = accepted_si[j]
                 else:
                     topk_vals, _ = all_clean_logits.topk(
                         self.fast_verify_topk, dim=-1
                     )
                     topk_thresholds = topk_vals[:, -1]
-                    all_accepted = spec_logit_vals >= topk_thresholds
-                # Correction: argmax (fast, deterministic)
-                all_corr_tokens = all_clean_logits.argmax(dim=-1)
+                    all_accepted_gpu = spec_logit_vals >= topk_thresholds
+                all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
+            elif self.temperature <= 0:
+                all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
+                all_accepted_gpu = all_spec_vals_t == all_corr_tokens_gpu
             else:
-                # Standard verify: full p/q ratio with softmax
-                if self.temperature <= 0:
-                    # Greedy: deterministic accept (spec == argmax) + argmax correction
-                    all_corr_tokens = all_clean_logits.argmax(dim=-1)
-                    all_accepted = all_spec_vals_t == all_corr_tokens
+                # Standard verify: softmax + p/q ratio + correction
+                if self.temperature != 1.0:
+                    all_clean_logits = all_clean_logits / self.temperature
+                all_clean_probs = F.softmax(all_clean_logits, dim=-1)
+
+                all_draft_probs_t = torch.stack(all_draft_prob_list)
+                all_p = all_clean_probs.gather(
+                    1, all_spec_vals_t.unsqueeze(1)
+                ).squeeze(1)
+                all_q = all_draft_probs_t.gather(
+                    1, all_spec_vals_t.unsqueeze(1)
+                ).squeeze(1)
+                alpha = self.verify_alpha
+                if alpha <= 0:
+                    all_accepted_gpu = torch.ones(
+                        nv * vns, dtype=torch.bool, device=device
+                    )
                 else:
-                    if self.temperature != 1.0:
-                        all_clean_logits = all_clean_logits / self.temperature
-                    all_clean_probs = F.softmax(all_clean_logits, dim=-1)
-
-                    # Stack draft probs for batched p/q ratio computation
-                    all_draft_probs_t = torch.stack(all_draft_prob_list)  # [nv*vns, vocab]
-                    all_p = all_clean_probs.gather(
-                        1, all_spec_vals_t.unsqueeze(1)
-                    ).squeeze(1)
-                    all_q = all_draft_probs_t.gather(
-                        1, all_spec_vals_t.unsqueeze(1)
-                    ).squeeze(1)
-                    alpha = self.verify_alpha
-                    if alpha <= 0:
-                        all_accepted = torch.ones(
-                            nv * vns, dtype=torch.bool, device=device
-                        )
-                    else:
-                        scaled_q = all_q * alpha
-                        all_ratios = torch.where(
-                            scaled_q > 0, all_p / scaled_q,
-                            torch.zeros_like(all_p),
-                        )
-                        all_rands = torch.rand(nv * vns, device=device)
-                        all_accepted = (all_ratios >= 1.0) | (
-                            all_rands < all_ratios
-                        )
-                    # Correct rejection sampling: max(0, p - q), normalized
-                    corrected_dist = torch.clamp(
-                        all_clean_probs - all_draft_probs_t, min=0
+                    scaled_q = all_q * alpha
+                    all_ratios = torch.where(
+                        scaled_q > 0, all_p / scaled_q,
+                        torch.zeros_like(all_p),
                     )
-                    corrected_sums = corrected_dist.sum(dim=-1, keepdim=True)
-                    # Fallback to clean probs if corrected dist is all zeros
-                    use_fallback = (corrected_sums.squeeze(-1) <= 0)
-                    corrected_dist = torch.where(
-                        corrected_sums > 0,
-                        corrected_dist / corrected_sums,
-                        all_clean_probs,
+                    all_rands = torch.rand(nv * vns, device=device)
+                    all_accepted_gpu = (all_ratios >= 1.0) | (
+                        all_rands < all_ratios
                     )
-                    all_corr_tokens = torch.multinomial(
-                        corrected_dist, num_samples=1
-                    ).squeeze(1)
+                corrected_dist = torch.clamp(
+                    all_clean_probs - all_draft_probs_t, min=0
+                )
+                corrected_sums = corrected_dist.sum(dim=-1, keepdim=True)
+                corrected_dist = torch.where(
+                    corrected_sums > 0,
+                    corrected_dist / corrected_sums,
+                    all_clean_probs,
+                )
+                all_corr_tokens_gpu = torch.multinomial(
+                    corrected_dist, num_samples=1
+                ).squeeze(1)
 
-            # Single GPU→CPU sync for acceptance + corrections
-            _packed = torch.cat([all_accepted.to(torch.int32), all_corr_tokens])
-            _packed_cpu = _packed.tolist()
-            all_accepted_cpu = _packed_cpu[:nv * vns]
-            all_corr_cpu = _packed_cpu[nv * vns:]
+        # Speculative sampling for ALL verify + cold bids (before knowing verify results)
+        if sample_logit_indices:
+            all_sample_logits = full_logits[
+                torch.tensor(sample_logit_indices, dtype=torch.long, device=device)
+            ]
+            all_sample_ids_gpu, _ = _batched_sample(
+                all_sample_logits, self.temperature, self.top_k, self.top_p
+            )
+
+            # Compute draft probs at spec positions
+            draft_indices = []
+            for group_start in range(0, len(sample_logit_indices), gs):
+                for m in range(num_masks):
+                    draft_indices.append(group_start + 1 + m)
+            if draft_indices:
+                draft_logits = all_sample_logits[draft_indices]
+                if self.temperature > 0 and self.temperature != 1.0:
+                    draft_logits = draft_logits / self.temperature
+                draft_probs_all = F.softmax(draft_logits, dim=-1)
+
+        # --- Single GPU→CPU sync: pack everything ---
+        gpu_parts = []
+        verify_len = 0
+        if all_accepted_gpu is not None:
+            verify_len = nv * vns
+            gpu_parts.append(all_accepted_gpu.to(torch.int32))
+            gpu_parts.append(all_corr_tokens_gpu)
+        sample_len = 0
+        if all_sample_ids_gpu is not None:
+            sample_len = all_sample_ids_gpu.shape[0]
+            gpu_parts.append(all_sample_ids_gpu)
+
+        if gpu_parts:
+            _mega_packed = torch.cat(gpu_parts)
+            _mega_cpu = _mega_packed.tolist()
+        else:
+            _mega_cpu = []
+
+        # --- CPU unpack ---
+        if verify_len > 0:
+            all_accepted_cpu = _mega_cpu[:verify_len]
+            all_corr_cpu = _mega_cpu[verify_len:2 * verify_len]
 
             for k, bid in enumerate(verify_bids):
                 base_k = k * vns
@@ -505,69 +576,28 @@ class DreamShiftBlockN(DllmAlgorithm):
                         all_corr_cpu[base_k + si] for si in range(vns)
                     ]
 
-        # ── Step 2: Batched sampling (decode requests only) ────────
-        accepted_verify_bids = [
-            bid for bid in verify_bids if bid not in reject_at
-        ]
-        gs = 1 + num_masks
-
-        sample_logit_indices = []
-        sample_bid_roles = []
-
-        for bid in accepted_verify_bids:
-            n_specs = len(old_specs[bid])
-            clean_idx = base_offsets[bid] + n_specs
-            for j in range(gs):
-                sample_logit_indices.append(clean_idx + j)
-            sample_bid_roles.append(bid)
-
-        for bid in cold_bids:
-            base = base_offsets[bid]
-            for j in range(gs):
-                sample_logit_indices.append(base + j)
-            sample_bid_roles.append(bid)
-
         sampled_results = {}
-        draft_probs_map = {}  # bid -> list of [vocab_size] tensors
-        if sample_logit_indices:
-            all_logits = full_logits[
-                torch.tensor(sample_logit_indices, dtype=torch.long, device=device)
-            ]
-            all_ids, all_probs = _batched_sample(
-                all_logits, self.temperature, self.top_k, self.top_p
-            )
-
-            # Compute full draft probability distributions at spec positions
-            draft_indices = []
-            for group_start in range(0, len(sample_logit_indices), gs):
-                for m in range(num_masks):
-                    draft_indices.append(group_start + 1 + m)
-
-            all_ids_cpu = all_ids.tolist()
-
-            # Compute softmax of draft logits for full distributions
-            if draft_indices:
-                draft_logits = all_logits[draft_indices]
-                if self.temperature > 0 and self.temperature != 1.0:
-                    draft_logits = draft_logits / self.temperature
-                draft_probs_all = F.softmax(draft_logits, dim=-1)  # [n_drafts, vocab]
-            else:
-                draft_probs_all = None
+        draft_probs_map = {}
+        if sample_len > 0:
+            all_ids_cpu = _mega_cpu[2 * verify_len:]
 
             offset = 0
             draft_offset = 0
             for bid in sample_bid_roles:
-                sampled_results[bid] = all_ids_cpu[offset:offset + gs]
-                if draft_probs_all is not None:
-                    # Store full distribution per spec token (detached GPU tensors)
-                    draft_probs_map[bid] = [
-                        draft_probs_all[draft_offset + m]
-                        for m in range(num_masks)
-                    ]
-                else:
-                    draft_probs_map[bid] = []
+                if bid not in reject_at:
+                    sampled_results[bid] = all_ids_cpu[offset:offset + gs]
+                    if draft_probs_all is not None:
+                        draft_probs_map[bid] = [
+                            draft_probs_all[draft_offset + m]
+                            for m in range(num_masks)
+                        ]
+                    else:
+                        draft_probs_map[bid] = []
                 offset += gs
                 draft_offset += num_masks
+
+        if self._timing_enabled:
+            _t_phase3_end = time.perf_counter()
 
         # ── Step 3: Batched KV trim index lookup (decode only) ─────
         trim_counts = {}
@@ -713,9 +743,16 @@ class DreamShiftBlockN(DllmAlgorithm):
                 f"next: pend={n_pend} specs={n_specs[:3]}..."
             )
 
-        # Stats
+        # Stats + optional timing
         self._stats["total_forwards"] += 1
         self._stats["total_tokens"] += sum(len(t) for t in next_token_ids_list)
+        if self._timing_enabled and has_any_decode:
+            _t_run_end = time.perf_counter()
+            self._timing["phase1_classify"] += (_t_phase1_end - _t_run_start)
+            self._timing["phase2_forward"] += (_t_phase2_end - _t_phase1_end)
+            self._timing["phase3_verify_sample"] += (_t_phase3_end - _t_phase2_end)
+            self._timing["phase4_trim_assemble"] += (_t_run_end - _t_phase3_end)
+            self._timing["timing_count"] += 1
         if self._stats["total_forwards"] % 500 == 0:
             s = self._stats
             n = s["total_forwards"]
@@ -726,9 +763,19 @@ class DreamShiftBlockN(DllmAlgorithm):
                 if total_decisions > 0
                 else 0
             )
+            timing_str = ""
+            if self._timing_enabled:
+                t = self._timing
+                tc = max(t["timing_count"], 1)
+                timing_str = (
+                    f" timing(ms): classify={t['phase1_classify']/tc*1000:.2f} "
+                    f"forward={t['phase2_forward']/tc*1000:.2f} "
+                    f"verify_sample={t['phase3_verify_sample']/tc*1000:.2f} "
+                    f"trim_assemble={t['phase4_trim_assemble']/tc*1000:.2f}"
+                )
             logger.info(
                 f"[DreamShiftBlockN] N={self.gen_block_size}, fwd={n}, bs={batch_size}, "
-                f"tok/fwd={tok_per_fwd:.2f}, accept={accept_rate:.1f}%"
+                f"tok/fwd={tok_per_fwd:.2f}, accept={accept_rate:.1f}%{timing_str}"
             )
 
         return logits_output, next_token_ids_list, out.can_run_graph
