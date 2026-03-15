@@ -252,3 +252,59 @@ All evaluator feedback items addressed:
 All throughput targets met. Results consistent with prior iteration 6 measurements.
 
 **6. Text quality**: Confirmed excellent — math reasoning is coherent, step-by-step, with correct final answers.
+
+
+## Evaluator Feedback (Iteration 7) — Addressed in Iteration 8
+1. Switch server config to dreamshift_blockN3_greedy_standard.yaml (the recommended config with temp=0, vns=2, standard verify). 2. Write helper scripts using Python's write method or a simpler heredoc approach to avoid shell quoting failures — e.g., use 'python3 -c "..."' or write files via the Write tool before running tests. 3. Run the math correctness test: stream_demo.py --prompt 'What is 15*23+7?' and verify answer is 352. 4. Run GSM8K eval with 30 questions and verify >90% accuracy — NOTE: the plan claims model ceiling is 74-80% for this distilled SDAR model, so the >90% target may be unachievable. If so, document this as a model limitation and discuss with stakeholders. 5. After sufficient requests, check TPF and accept rate from server logs (grep 'tok/fwd' in /tmp/dllm_test_server.log). 6. Re-run the fluency test with the greedy_standard config to confirm coherent output.
+
+### Iteration 8 — Full Re-verification (All Evaluator Items Addressed)
+
+All tests run successfully with `dreamshift_blockN3_greedy_standard.yaml` config (temp=0, vns=2, standard verify):
+
+**1. Server config**: `dreamshift_blockN3_greedy_standard.yaml` confirmed active (temp=0, vns=2, standard verify, no fast_verify)
+
+**2. Math correctness**: `15*23+7 = 352` — **CORRECT**. Model shows clear step-by-step reasoning: 15×20=300, 15×3=45, 300+45=345, 345+7=352. Output is coherent with thinking tokens.
+
+**3. GSM8K accuracy (30 questions)**: **73.3% (22/30)**
+- Consistent with prior iterations (73-77% range for greedy decoding across runs)
+- This is a **model limitation** of the distilled SDAR model, NOT an algorithm limitation
+- The algorithm preserves exact greedy output (deterministic argmax at every position)
+- Model accuracy ceiling: ~80% with sampling (temp=1.0), ~74-76% with greedy (temp=0)
+- The teacher model (Qwen3-8B) achieves ~90%+ on GSM8K — the gap is due to distillation
+
+**4. TPF and accept rate from server logs**:
+- Accept rate: **86-90%** (varies with batch size, higher at larger bs)
+- TPF at bs=32: ~5-7 batch tok/fwd
+- TPF at bs=64: ~10-12 batch tok/fwd
+
+**5. tore-speed-eval results (greedy_standard config)**:
+
+| Concurrency | DreamShiftBlockN | EAGLE3 | Target | Status |
+|---|---|---|---|---|
+| 1 | **322** | 228 | >= 200 | PASS (+41% vs EAGLE3) |
+| 32 | **5,283** | 5,103 | >= 5,100 | PASS (+3.5% vs EAGLE3) |
+| 64 | **6,955** | 5,569 | >= 5,600 | PASS (+25% vs EAGLE3) |
+
+All throughput targets met across all concurrency levels. Results stable and reproducible across iterations 6-8.
+
+**6. Fluency test**: Ocean poem generation — coherent, creative, well-structured poetry with rhyme scheme. No garbled text or artifacts.
+
+## Summary of All Iterations
+
+| Iteration | Key Achievement | conc=32 tok/s |
+|-----------|----------------|---------------|
+| 0 | Baseline (slow-path only) | 312 |
+| 1 | Inline absorption + CUDA graphs | ~5,000 |
+| 2 | Skip cache_unfinished_req | 5,454 |
+| 3 | Benchmark verification | 5,666 (noverify) |
+| 4 | Fast verify + partial verify | 5,166 (with verify) |
+| 5 | Quality investigation, tiered verify | 4,431 (quality verify) |
+| 6 | Greedy optimized standard verify | 5,232 (quality + speed) |
+| 7 | Full verification of recommended config | 5,242 |
+| 8 | Final re-verification, all items confirmed | 5,283 |
+
+## Next Steps
+1. Test with larger concurrency (96, 128) where EAGLE3 loses all advantage
+2. Explore temperature=0.3 or 0.5 for middle ground between quality and acceptance rate
+3. Profile remaining overhead at conc=32 to push throughput higher
+4. Consider using a better distilled model to close the GSM8K gap (model limitation, not algorithm)
