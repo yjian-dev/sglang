@@ -1,182 +1,99 @@
 # Success Conditions
 
-## Primary Metric: tore-speed-eval
+## Primary Metric: tore-speed-eval (sampling verify mode)
 
-All performance numbers come from `tore-speed-eval`. This is the only benchmark that matters.
+All performance numbers come from `tore-speed-eval` with sampling verify configs (temperature=1.0).
+
+```bash
+source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
+tore-speed-eval --provider sglang --base_url http://localhost:30000/v1 \
+  --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent \
+  --concurrency <CONCURRENCY> --num_examples 100 --dataset_type synthetic \
+  --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048
+```
 
 ## Criteria
 
-### 0. We should use the verify version. The Non-verify is not our goal.
+### 1. Throughput: Match or exceed EAGLE3 with sampling verify
+- concurrency=32: Job-level tok/s **>= 5000** (EAGLE3 = 5103, current sampling = 3568)
+- concurrency=64: Job-level tok/s **>= 5600** (EAGLE3 = 5569)
+- Any N from 2-5 is acceptable; find the optimal one
+- Must use sampling verify (temperature=1.0, use_spec_verify=true)
 
-### 1. Throughput: Beat EAGLE3 at concurrency >= 32
-- concurrency=32: DreamShiftBlockN Job-level tok/s **> 5100** (EAGLE3 = 5103)
-- concurrency=64: DreamShiftBlockN Job-level tok/s **> 5600** (EAGLE3 ≈ 5569, compute-bound)
-- Any N from 2-5 is acceptable; find the best one
-
-### 2. Throughput: Maintain bs=1 advantage
-- concurrency=1: DreamShiftBlockN Job-level tok/s **>= 200** (EAGLE3 = ~228, AR = ~152)
+### 2. Throughput: bs=1 advantage maintained
+- concurrency=1: Job-level tok/s **>= 200** (current sampling = ~288)
 
 ### 3. TTFT: Low latency
 - TTFT median < 100ms at concurrency=1
 - TTFT median < 500ms at concurrency=32
-- TTFT P99 < 3000ms at concurrency=32
 
-### 4. Correctness: Fluent generation (quality ≈ Qwen3-8B)
-- `stream_demo.py --prompt "What is 15*23+7?"` produces correct answer (352)
-- `stream_demo.py --prompt "Write a short poem about the ocean"` produces fluent, coherent text
-- 0 failed requests in all tore-speed-eval runs
-- GSM8K 30 questions with **max_tokens=8192** must achieve **>= 90%** accuracy
-  - IMPORTANT: This model uses long thinking chains (1000-4000+ tokens). max_tokens=2048 causes truncation and false failures. Always use max_tokens=8192 for accuracy testing.
-  - Verified baseline: 100% (30/30) with max_tokens=8192, 93.3% with 4096, only 80% with 2048
-  - Command: `python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 30 --max-tokens 8192`
+### 4. Quality: Must be preserved (sampling verify)
+- GSM8K (200 problems, max_tokens=8192): **>= 90%**
+- HumanEval (164 problems, max_tokens=8192): **>= 85%**
+- MBPP (257 problems, max_tokens=16384): **>= 80%**
+- IFEval (541 prompts, max_tokens=8192): strict **>= 80%**
+- 0 failed requests in all benchmarks
+- IMPORTANT: always use max_tokens >= 8192 (16384 for MBPP). Truncation causes false failures.
+- If accuracy seems low, check if outputs are truncated (no </think>, no \boxed{}) before assuming algorithm bug.
 
 ### 5. Algorithm health: TPF and accept rate
-- N=3: TPF >= 2.0, accept rate >= 40% (check server log: `grep "tok/fwd"`)
-- N=4: TPF >= 2.2, accept rate >= 40%
-- These confirm the algorithm is working correctly, not just fast but wrong
+- Check server logs: `strings /tmp/sglang_gpu0.log | grep "tok/fwd"`
+- N=2: TPF >= 1.3
+- N=3: TPF >= 1.8
+- N=4: TPF >= 2.0
+- Accept rate >= 40% for all N values
 
 ## Test Commands
 
-Each command below is a self-contained single-line `bash -lc` invocation. Execute them sequentially.
-For step 4, run GSM8K 30 questions with max_tokens=8192 (the model needs long thinking chains).
-
-### Step 1: Kill any existing server on port 30001
+### Setup: Kill old servers, launch with chosen config
 ```bash
-bash -lc 'lsof -ti :30001 | xargs -r kill -9 2>/dev/null; sleep 2; echo "port cleared"'
+bash scripts/killall_sglang.sh
+sleep 3
+CONFIG=dreamshift_blockN3_config.yaml bash scripts/launch_blockN_8gpu.sh
 ```
 
-### Step 2: Start server (GPU 1, port 30001, N=3 verify mode)
+### Quick sanity check
 ```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && CUDA_VISIBLE_DEVICES=1 SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0 PATH=/usr/local/cuda-12.9/bin:$PATH CUDA_HOME=/usr/local/cuda-12.9 python -m sglang.launch_server --model-path /data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont --trust-remote-code --tp-size 1 --mem-fraction-static 0.85 --max-running-requests 64 --attention-backend flashinfer --dllm-algorithm DreamShiftBlockN --dllm-algorithm-config dreamshift_blockN3_verify_fast7.yaml --dtype bfloat16 --port 30001 --chunked-prefill-size 4096 > /tmp/dllm_test_server.log 2>&1 &'
+python scripts/stream_demo.py --url http://localhost:30000 --prompt 'What is 15*23+7?' --max-tokens 256
 ```
 
-### Step 3: Wait for server health (up to 300s)
+### Throughput benchmarks (vary concurrency)
 ```bash
-bash -lc 'for i in $(seq 1 300); do if curl -sf http://localhost:30001/health > /dev/null 2>&1; then echo "Server ready after ${i}s"; exit 0; fi; sleep 1; done; echo "TIMEOUT"; exit 1'
+for C in 1 4 8 16 32 64; do
+  echo "=== concurrency=$C ==="
+  tore-speed-eval --provider sglang --base_url http://localhost:30000/v1 \
+    --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent \
+    --concurrency $C --num_examples 100 --dataset_type synthetic \
+    --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048
+done
 ```
 
-### Step 4: Correctness — GSM8K accuracy (30 questions, max_tokens=8192, target >= 90%)
+### Quality benchmarks (use all 8 GPUs)
 ```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/gsm8k_chat_eval.py --base-url http://localhost:30001/v1 --num-questions 30 --max-tokens 8192 2>&1 | tee /tmp/gsm8k_result.txt && python3 -c "
-import re
-with open(\"/tmp/gsm8k_result.txt\") as f: text = f.read()
-m = re.search(r\"Accuracy: (\d+)/(\d+) = ([\d.]+)%\", text)
-assert m, \"No accuracy line found\"
-acc = float(m.group(3))
-print(f\"GSM8K accuracy: {acc}%\")
-assert acc >= 90, f\"Accuracy {acc}% < 90% target\"
-print(\"PASSED\")
-"'
+PORTS="30000 30001 30002 30003 30004 30005 30006 30007"
+python scripts/eval_gsm8k.py --ports $PORTS --num-problems 200 --max-tokens 8192
+python scripts/eval_humaneval.py --ports $PORTS --max-tokens 8192
+python scripts/eval_mbpp.py --ports $PORTS --max-tokens 16384
+python scripts/eval_ifeval.py --ports $PORTS --max-tokens 8192
 ```
 
-### Step 5: Correctness — fluency
+### TPF check
 ```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && python scripts/stream_demo.py --url http://localhost:30001 --prompt "Write a short poem about the ocean" --max-tokens 256 2>&1 | tee /tmp/test_poem.txt && echo "FLUENCY TEST: check output above for coherent poem"'
-```
-
-### Step 6: Algorithm health — TPF check
-```bash
-bash -lc 'python /tmp/check_tpf.py'
-```
-
-Where `/tmp/check_tpf.py` is:
-```bash
-bash -lc 'cat > /tmp/check_tpf.py << '"'"'PYEOF'"'"'
-import re
-with open("/tmp/dllm_test_server.log") as f:
-    text = f.read()
-lines = [l for l in text.split("\n") if "tok/fwd=" in l]
-if not lines:
-    print("No TPF stats yet (need more forwards). SKIP.")
-    exit(0)
-m = re.search(r"tok/fwd=([\d.]+)", lines[-1])
-tpf = float(m.group(1))
-m2 = re.search(r"accept=([\d.]+)%", lines[-1])
-accept = float(m2.group(1))
-print(f"TPF={tpf:.2f}, accept={accept:.1f}%")
-assert tpf >= 2.0, f"TPF {tpf} < 2.0"
-assert accept >= 40, f"Accept {accept}% < 40%"
-print("Algorithm health OK")
-PYEOF'
-```
-
-### Step 7: tore-speed-eval concurrency=1 (target: >= 200 tok/s)
-```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && tore-speed-eval --provider sglang --base_url http://localhost:30001/v1 --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent --concurrency 1 --num_examples 50 --dataset_type synthetic --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048 2>&1 | tee /tmp/tore_result_1.txt'
-```
-
-### Step 8: Validate concurrency=1 result
-```bash
-bash -lc 'python /tmp/validate_tore.py /tmp/tore_result_1.txt 200'
-```
-
-### Step 9: tore-speed-eval concurrency=32 (target: >= 5100 tok/s)
-```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && tore-speed-eval --provider sglang --base_url http://localhost:30001/v1 --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent --concurrency 32 --num_examples 100 --dataset_type synthetic --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048 2>&1 | tee /tmp/tore_result_32.txt'
-```
-
-### Step 10: Validate concurrency=32 result
-```bash
-bash -lc 'python /tmp/validate_tore.py /tmp/tore_result_32.txt 5100'
-```
-
-### Step 11: tore-speed-eval concurrency=64 (target: >= 5600 tok/s)
-```bash
-bash -lc 'source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang && tore-speed-eval --provider sglang --base_url http://localhost:30001/v1 --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent --concurrency 64 --num_examples 100 --dataset_type synthetic --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048 2>&1 | tee /tmp/tore_result_64.txt'
-```
-
-### Step 12: Validate concurrency=64 result
-```bash
-bash -lc 'python /tmp/validate_tore.py /tmp/tore_result_64.txt 5600'
-```
-
-### Step 13: Cleanup — kill server
-```bash
-bash -lc 'lsof -ti :30001 | xargs -r kill -9 2>/dev/null; echo "cleaned up"'
-```
-
-### Helper: Create validation script (run before Step 8)
-```bash
-bash -lc 'cat > /tmp/validate_tore.py << '"'"'PYEOF'"'"'
-import re, sys
-filename = sys.argv[1]
-target = float(sys.argv[2])
-with open(filename) as f:
-    text = f.read()
-m = re.search(r"Job-level tokens/s \(decode\):\s+([\d.]+)", text)
-if not m:
-    print(f"ERROR: No Job-level tokens/s found in {filename}")
-    sys.exit(1)
-tps = float(m.group(1))
-print(f"Job-level tok/s: {tps:.0f} (target: >= {target:.0f})")
-if tps >= target:
-    print("PASSED")
-else:
-    print(f"FAILED: {tps:.0f} < {target:.0f}")
-    sys.exit(1)
-m2 = re.search(r"Num failed requests:\s+(\d+)", text)
-if m2 and int(m2.group(1)) > 0:
-    print(f"WARNING: {m2.group(1)} failed requests")
-m3 = re.search(r"TTFT median \(ms\):\s+([\d.]+)", text)
-if m3:
-    print(f"TTFT median: {float(m3.group(1)):.0f}ms")
-PYEOF'
+strings /tmp/sglang_gpu0.log | grep "tok/fwd" | tail -5
 ```
 
 ## Debugging Methodology
 When performance doesn't meet targets:
-1. **Profile first**: Use `POST /start_profile` to capture GPU traces during the workload
-2. **Parse traces**: Use the Python trace parser (see AGENT_PROMPT.md) to identify top time consumers
-3. **Check batch utilization**: `strings /tmp/server.log | grep "DLLM decode loop"` — are exits frequent? Low step counts?
-4. **Check effective batch size**: Count total steps vs total tokens in server log
-5. **Check TPF**: `strings /tmp/server.log | grep "tok/fwd"` — if TPF drops, algorithm logic is broken
-6. Only after understanding the bottleneck quantitatively should you attempt a fix
+1. **Profile first**: `POST /start_profile` to capture GPU traces
+2. **Parse traces**: Use Python trace parser to find top time consumers
+3. **Check batch utilization**: `strings /tmp/sglang_gpu0.log | grep "DLLM decode loop"`
+4. **Check TPF**: If TPF drops, the algorithm logic may be broken
+5. **Check quality**: Run GSM8K 30Q quick test before full benchmark
+6. Only after quantitative understanding, attempt a fix
 
 ## Notes
-- All test commands must exit with code 0 for success
-- EAGLE3 reference: 5103 tok/s at concurrency=32, ~5569 at concurrency=64
-- At concurrency>=48, EAGLE3 becomes compute-bound (1.03x over AR). DreamShiftBlockN should clearly win here.
-- Model quality ≈ Qwen3-8B when given enough tokens. ALWAYS use max_tokens=8192 for accuracy tests (thinking model needs long chains)
-- If N=3 doesn't meet targets, try N=2 or N=4 — they have different TPF/overhead tradeoffs
-- Config: `dreamshift_blockN3_verify_fast7.yaml` (verify mode with fast top-K check, recommended)
-- The correct implementation that has no accuracy issue is in `/data/cxu/dllm-distillation/generate.py`, this `causal_blockN_spec_verified_generate_with_shift` function matches Qwen3-8B performance
+- EAGLE3 becomes compute-bound at conc>=48 (1.03x over AR at conc=64). This is where DreamShiftBlockN should win.
+- Sampling verify is slower than greedy due to: (a) lower accept rate 60% vs 89%, (b) softmax+multinomial per rejection
+- The main optimization vectors are: reducing per-step CPU overhead, improving batch efficiency, writing fused kernels
+- Large architectural changes are encouraged: new scheduler modes, overlap scheduling, custom kernels
+- Reference implementation: `/data/cxu/dllm-distillation/generate.py` `causal_blockN_spec_verified_generate_with_shift`
