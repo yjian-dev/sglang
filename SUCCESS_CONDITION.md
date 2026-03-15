@@ -164,3 +164,4 @@ When performance doesn't meet targets:
 - Model quality is assumed ≈ Qwen3-8B (distilled from it); no accuracy testing needed, just verify fluent coherent output
 - If N=3 doesn't meet targets, try N=2 or N=4 — they have different TPF/overhead tradeoffs
 - Config: `dreamshift_blockN3_verify_fast7.yaml` (verify mode with fast top-K check, recommended)
+- The correct implementation that has no accuracy issue is in `/data/cxu/dllm-distillation/generate.py`, this `causal_blockN_spec_verified_generate_with_shift` function matches Qwen3-8B performance
