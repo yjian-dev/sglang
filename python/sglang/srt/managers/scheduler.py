@@ -1168,7 +1168,10 @@ class Scheduler(
             ]
 
     def _dllm_decode_loop(self, initial_batch):
-        """DLLM decode-mode inner loop: reuse batch with prepare_for_dllm_decode."""
+        """DLLM decode-mode inner loop: reuse batch with prepare_for_dllm_decode.
+
+        Overlaps recv_requests with GPU forward to hide scheduling latency.
+        """
         steps = 0
         exit_reason = "unknown"
         batch = initial_batch
@@ -1182,13 +1185,22 @@ class Scheduler(
         _t_filter = 0.0
         _t_absorb = 0.0
         _n_absorb = 0
+        _recv_done = False  # True when recv was done during overlap window
+        _overlap_recv_reqs = []  # Buffered recv results from overlap
 
         try:
             while True:
                 _t0 = time.perf_counter()
-                recv_reqs = self.recv_requests()
-                if recv_reqs:
-                    self.process_input_requests(recv_reqs)
+                if not _recv_done:
+                    recv_reqs = self.recv_requests()
+                    if recv_reqs:
+                        self.process_input_requests(recv_reqs)
+                else:
+                    # Already received during overlap — process buffered results
+                    if _overlap_recv_reqs:
+                        self.process_input_requests(_overlap_recv_reqs)
+                    _recv_done = False
+                    _overlap_recv_reqs = []
                 _ta = time.perf_counter()
                 _t_recv += (_ta - _t0)
 
@@ -1228,8 +1240,24 @@ class Scheduler(
                 _t2 = time.perf_counter()
                 _t_prep += (_t2 - _t1)
 
+                # Forward with overlap: recv_requests runs while GPU computes
                 self.cur_batch = batch
-                result = self.run_batch(batch)
+                self.forward_ct += 1
+                self._profile_batch_predicate(batch)
+                model_worker_batch = batch.get_model_worker_batch()
+
+                def _overlap_fn():
+                    nonlocal _recv_done, _overlap_recv_reqs
+                    _overlap_recv_reqs = self.recv_requests()
+                    _recv_done = True
+
+                model_worker_batch._dllm_overlap_fn = _overlap_fn
+                with self.record_forward_metrics(batch):
+                    result = self.model_worker.forward_batch_generation(
+                        model_worker_batch
+                    )
+                batch.output_ids = result.next_token_ids
+
                 _t3 = time.perf_counter()
                 _t_forward += (_t3 - _t2)
                 self.process_batch_result(batch, result)

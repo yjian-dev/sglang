@@ -2099,21 +2099,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = None
         self.output_ids = None
 
-        # 5. Write KV slots via batched scatter (pre-allocated lists)
-        rpx_indices = [0] * num_tokens
-        pos_indices = [0] * num_tokens
-        offset = 0
-        for i in range(bs):
-            rpx = rpx_list[i]
-            pl = prefix_lens[i]
-            ext = extend_lens[i]
-            for t in range(ext):
-                rpx_indices[offset] = rpx
-                pos_indices[offset] = pl + t
-                offset += 1
-        self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
-            self.req_to_token_pool.req_to_token.dtype
-        )
+        # 5. Write KV slots via batched scatter
+        # Vectorized for pure-decode batches (all extend_lens == block_size)
+        if all(el == block_size for el in extend_lens):
+            # Fast path: uniform extend lengths — use vectorized torch ops
+            rpx_t = torch.tensor(rpx_list, dtype=torch.long)
+            pl_t = torch.tensor(prefix_lens, dtype=torch.long)
+            rpx_indices = rpx_t.repeat_interleave(block_size)
+            pos_base = pl_t.repeat_interleave(block_size)
+            pos_offsets = torch.arange(block_size).repeat(bs)
+            pos_indices = pos_base + pos_offsets
+            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
+                self.req_to_token_pool.req_to_token.dtype
+            )
+        else:
+            # Mixed batch: variable extend lengths (inline prefill)
+            rpx_indices = [0] * num_tokens
+            pos_indices = [0] * num_tokens
+            offset = 0
+            for i in range(bs):
+                rpx = rpx_list[i]
+                pl = prefix_lens[i]
+                ext = extend_lens[i]
+                for t in range(ext):
+                    rpx_indices[offset] = rpx
+                    pos_indices[offset] = pl + t
+                    offset += 1
+            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
+                self.req_to_token_pool.req_to_token.dtype
+            )
         self.out_cache_loc = out_cache_loc
 
         # 6. Update per-request memory fields
