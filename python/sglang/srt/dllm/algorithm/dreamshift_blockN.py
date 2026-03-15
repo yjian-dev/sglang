@@ -160,6 +160,11 @@ class DreamShiftBlockN(DllmAlgorithm):
         self.fast_verify: bool = config.algorithm_config.get("fast_verify", False)
         # Logit threshold for fast verify: accept if logit(spec) is in top-K logits
         self.fast_verify_topk: int = config.algorithm_config.get("fast_verify_topk", 5)
+        # Per-spec topk values for tiered verification (e.g., [7, 50] for strict spec0, lenient spec1)
+        # If set, overrides fast_verify_topk for individual specs
+        self.fast_verify_topk_per_spec: List[int] = config.algorithm_config.get(
+            "fast_verify_topk_per_spec", []
+        )
 
         # Per-request state (keyed by req_pool_idx)
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
@@ -390,16 +395,33 @@ class DreamShiftBlockN(DllmAlgorithm):
 
             if self.fast_verify:
                 # Fast verify: accept if spec token is in top-K logits
-                # No softmax needed — just compare logit ranks
                 spec_logit_vals = all_clean_logits.gather(
                     1, all_spec_vals_t.unsqueeze(1)
                 ).squeeze(1)
-                topk_vals, _ = all_clean_logits.topk(
-                    self.fast_verify_topk, dim=-1
-                )
-                topk_thresholds = topk_vals[:, -1]
-                all_accepted = spec_logit_vals >= topk_thresholds
-                # Correction: argmax (no softmax/multinomial)
+
+                if self.fast_verify_topk_per_spec and vns > 1:
+                    # Tiered verification: different topk per spec position
+                    per_spec_topk = self.fast_verify_topk_per_spec
+                    all_accepted = torch.zeros(nv * vns, dtype=torch.bool, device=device)
+                    for si in range(vns):
+                        k = per_spec_topk[si] if si < len(per_spec_topk) else self.fast_verify_topk
+                        # Indices for this spec position across all verify bids
+                        si_indices = list(range(si, nv * vns, vns))
+                        si_logits = all_clean_logits[si_indices]
+                        si_spec_vals = spec_logit_vals[si_indices]
+                        topk_vals_si, _ = si_logits.topk(k, dim=-1)
+                        thresholds_si = topk_vals_si[:, -1]
+                        accepted_si = si_spec_vals >= thresholds_si
+                        for j, idx in enumerate(si_indices):
+                            all_accepted[idx] = accepted_si[j]
+                else:
+                    # Uniform topk for all specs
+                    topk_vals, _ = all_clean_logits.topk(
+                        self.fast_verify_topk, dim=-1
+                    )
+                    topk_thresholds = topk_vals[:, -1]
+                    all_accepted = spec_logit_vals >= topk_thresholds
+                # Correction: argmax (fast, deterministic)
                 all_corr_tokens = all_clean_logits.argmax(dim=-1)
             else:
                 # Standard verify: full p/q ratio with softmax

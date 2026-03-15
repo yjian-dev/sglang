@@ -1,0 +1,10 @@
+block_size: 3
+gen_block_size: 2
+confidence_threshold: 0.0
+temperature: 1.0
+top_k: 50
+top_p: 0.95
+use_spec_verify: true
+verify_num_specs: 1
+fast_verify: true
+fast_verify_topk: 7
