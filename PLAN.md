@@ -1,8 +1,8 @@
 # Plan
 
 ## Status
-Phase 1-8 complete. All quality benchmarks pass. Software optimization at its limit.
-**Iteration 5 conclusively proves the conc=32 gap is a hardware/model limitation, not a software one.**
+Phase 1-9 complete. All quality benchmarks pass. FP8 quantization validated.
+**Iteration 6: FP8 quantization gives +34% at conc=1 (277 tok/s, beats EAGLE3's 228 by 21%), neutral at conc=32.**
 
 ## Goal
 Maximize sampling verify throughput to match/exceed EAGLE3 (~5100 tok/s at conc=32) while maintaining quality (GSM8K >= 90%, HumanEval >= 85%).
@@ -10,16 +10,26 @@ Maximize sampling verify throughput to match/exceed EAGLE3 (~5100 tok/s at conc=
 ## Key Finding: Forward pass is memory-bound at conc<=32, compute-bound at conc>=64
 
 ### Throughput (tore-speed-eval, sampling verify, 1 GPU H100, 100 examples)
-| Concurrency | N=3 tok/s | N=2 tok/s | EAGLE3 | N=3 vs EAGLE3 |
-|------------|-----------|-----------|--------|---------------|
-| 1 | **207** | 187 | 228 | -9.2% |
-| 8 | **1413** | 1277 | — | — |
-| 16 | **2360** | 2166 | — | — |
-| 32 | **3728** | 3331 | 5103 | -26.9% |
-| 48 | **4160** | 3911 | — | — |
-| 64 | 4681 | **4811** | 5569 | -15.9% |
+| Concurrency | N=3 BF16 | N=3 FP8 | FP8 gain | EAGLE3 | FP8 vs EAGLE3 |
+|------------|----------|---------|----------|--------|---------------|
+| 1 | 207 | **277** | **+34%** | 228 | **+21%** |
+| 8 | 1413 | **1748** | **+24%** | — | — |
+| 16 | 2360 | **2479** | **+5%** | — | — |
+| 32 | 3728 | **3730** | +0% | 5103 | -27% |
+| 48 | 4160 | **4410** | **+6%** | — | — |
+| 64 | 4681 | **4727** | +1% | 5569 | -15% |
 
-### Quality (N=3, sampling verify, 8 GPU) — ALL PASS
+### Quality (N=3 FP8, sampling verify, 8 GPU) — ALL PASS
+| Benchmark | FP8 | BF16 | Threshold | Status |
+|-----------|-----|------|-----------|--------|
+| GSM8K (200Q) | **95.5%** | 96.0% | >= 90% | PASS |
+| HumanEval | **89.6%** | 92.7% | >= 85% | PASS |
+| MBPP | **93.4%** | 93.8% | >= 80% | PASS |
+| MATH-500 | **89.0%** | 89.6% | — | PASS |
+| IFEval inst-strict | **89.21%** | 88.73% | >= 80% | PASS |
+| IFEval prompt-strict | **84.29%** | 82.99% | — | PASS |
+
+### Quality (N=3 BF16, sampling verify, 8 GPU) — ALL PASS
 | Benchmark | Score | Threshold | Status |
 |-----------|-------|-----------|--------|
 | GSM8K (200Q) | **96.0%** | >= 90% | PASS |
@@ -126,6 +136,25 @@ Logs emit every 500 forwards to `/tmp/sglang_gpu{N}.log`. Accept rates:
 - `is_dllm_supported` check in `can_run()` verifies `batch_size * 5 == input_ids.numel()`
 - Pure-decode batches use CUDA graph; inline prefill batches fall back to eager extend
 
+### FP8 quantization analysis (Iteration 6)
+- **`--quantization fp8`** enables online W8A8 FP8 quantization (dynamic activation scaling)
+- At conc=1 (deeply memory-bound): **+34% throughput** — halved weight reads dominate
+- At conc=8: **+24%** — still significantly memory-bound
+- At conc=16-64: **+0-6%** — transitioning to compute-bound, FP8 benefit diminishes
+- **Quality impact**: ~1-3% degradation across benchmarks, all thresholds still pass
+- **IFEval actually improved** with FP8 (89.21% vs 88.73% inst-strict)
+- **FP8 at conc=1 beats EAGLE3 by 21%** (277 vs 228 tok/s)
+- Accept rate unchanged: ~57% (same as BF16)
+- **Recommended as new default** for conc<=16 workloads
+
+### TP=2 analysis (Iteration 6)
+- TP=2 (2 GPUs per server, 4 servers from 8 GPUs):
+  - conc=1: 257 tok/s (+24% per-server, but uses 2x GPUs)
+  - conc=32: 3616 (-3% per-server — NCCL all-reduce overhead cancels memory savings)
+  - conc=64: 5288 (+13% per-server)
+- **Fleet throughput at conc=32**: 4 servers × 3616 = 14,464 vs 8 servers × 3728 = 29,824 → **51% less fleet throughput**
+- **Not recommended**: per-server gains don't justify 2x GPU cost
+
 ## Tasks
 
 ### Phase 1: Find optimal N for sampling verify ✓
@@ -190,6 +219,25 @@ Logs emit every 500 forwards to `/tmp/sglang_gpu{N}.log`. Accept rates:
 - [x] **TPF logs confirmed during benchmarks**: Accept rate 78% (N=2), 52-58% (N=3)
 - [x] **Root cause documented**: EAGLE3 uses external draft model (self-drafting vs external)
 
+### Phase 9: FP8 quantization & TP=2 evaluation (Iteration 6) ✓
+- [x] **FP8 quantization (`--quantization fp8`) benchmarked at all concurrencies**
+  - conc=1: 277 tok/s (+34%, beats EAGLE3 by 21%)
+  - conc=8: 1748 (+24%)
+  - conc=16: 2479 (+5%)
+  - conc=32: 3730 (+0%)
+  - conc=48: 4410 (+6%)
+  - conc=64: 4727 (+1%)
+- [x] **FP8 quality validation — ALL PASS**
+  - GSM8K: 95.5%, HumanEval: 89.6%, MBPP: 93.4%, MATH-500: 89.0%
+  - IFEval inst-strict: 89.21%, prompt-strict: 84.29%
+- [x] **TP=2 (2 GPUs/server, 4 servers) benchmarked**
+  - Per-server: conc=1 +24%, conc=32 -3%, conc=64 +13%
+  - Fleet throughput halved at conc=32 → NOT recommended
+- [x] **FP8 recommended as new default for conc<=16**
+  - No code changes needed — just add `--quantization fp8` to launch command
+  - Quality degradation is 1-3%, within all thresholds
+  - FP8 accept rate identical to BF16 (~57%)
+
 ## Code Changes Made
 1. `python/sglang/srt/dllm/algorithm/fused_verify_kernel.py` (NEW):
    - Fused Triton kernel: `_fused_verify_kernel`
@@ -223,6 +271,8 @@ Logs emit every 500 forwards to `/tmp/sglang_gpu{N}.log`. Accept rates:
 3. **Cold-start optimization doesn't help**: model is memory-bound at conc=32, reducing tokens from 5→3 doesn't change forward time (identical 7.8ms at bs=1)
 4. **Selective lm_head doesn't help**: verify rounds use ALL 5 positions' logits; cold start wastes 40% but model is memory-bound so no speedup
 5. **Dual CUDA graph doesn't help**: zero benefit in memory-bound regime where 3-token and 5-token forwards take the same time
+6. **FP8 quantization doesn't help at conc=32**: +0% throughput (but +34% at conc=1)
+7. **TP=2 doesn't help at conc=32**: -3% per-server, halves fleet capacity
 
 **The gap is architectural:**
 - EAGLE3: external draft model (~100M params) generates spec tokens cheaply, target model processes ~1 token/req/fwd
@@ -230,16 +280,21 @@ Logs emit every 500 forwards to `/tmp/sglang_gpu{N}.log`. Accept rates:
 - At conc=32 (160 tokens, memory-bound): both read all 16GB of weights per forward, but DreamShift produces only 2.1 tokens/req while EAGLE3 produces ~4 tokens/req (higher accept rate from tree verification)
 
 ### What DreamShift BlockN N=3 achieves
-- **conc=1**: 207 tok/s (vs EAGLE3 228, -9%), but **quality is significantly higher**
-- **Quality**: GSM8K 96.0%, HumanEval 92.7%, MBPP 93.8%, IFEval strict 88.7%
+- **conc=1 (FP8)**: 277 tok/s — **beats EAGLE3 228 by 21%!**
+- **conc=1 (BF16)**: 207 tok/s (vs EAGLE3 228, -9%)
+- **conc=32 (FP8/BF16)**: ~3730 tok/s (vs EAGLE3 5103, -27%)
+- **Quality (FP8)**: GSM8K 95.5%, HumanEval 89.6%, MBPP 93.4%, IFEval strict 89.2%
+- **Quality (BF16)**: GSM8K 96.0%, HumanEval 92.7%, MBPP 93.8%, IFEval strict 88.7%
 - **No external draft model needed**: single model deployment, simpler infrastructure
 - **Near-optimal software**: 90%+ GPU utilization, fused kernels, overlap scheduling
+- **Recommended launch**: add `--quantization fp8` for best low-concurrency performance
 
 ### Paths to close the gap (require model/infrastructure changes)
-1. **FP8 quantization**: Halves weight reads → ~2x speedup at memory-bound regime. Expected conc=32: ~6000+ tok/s.
+1. **FP8 quantization** ✓ EVALUATED: +34% at conc=1 (beats EAGLE3!), but +0% at conc=32. Helps low concurrency only.
 2. **External draft model**: Use a small (~100M) model for speculative drafting, like EAGLE3. Fundamental algorithm change.
-3. **TP=2 per server**: Halves memory-bound time by distributing weight reads across 2 GPUs. Costs half the GPU fleet.
+3. **TP=2 per server** ✓ EVALUATED: -3% at conc=32 per-server, halves fleet throughput. NOT recommended.
 4. **Train N=2 model for high-concurrency**: Dedicated block_size=3 model. Useful only at conc=64+ where compute starts to dominate.
+5. **FP8 KV cache** (`--kv-cache-dtype fp8_e4m3`): Could free memory for more concurrent requests and reduce KV cache bandwidth. Not yet tested.
 
 ## Progress Log
 ### Iteration 1 (2026-03-15)
@@ -288,6 +343,31 @@ Logs emit every 500 forwards to `/tmp/sglang_gpu{N}.log`. Accept rates:
 - **Root cause analysis complete**: EAGLE3 uses external draft model, DreamShift self-drafts
 - **No code changes** — analysis-only iteration proving software optimization ceiling reached
 
+### Iteration 6 (2026-03-15)
+- **FP8 quantization (`--quantization fp8`) evaluated**:
+  - conc=1: 277 tok/s (+34% vs bf16, **beats EAGLE3 228 by 21%**)
+  - conc=8: 1748 (+24%), conc=16: 2479 (+5%)
+  - conc=32: 3730 (+0%), conc=48: 4410 (+6%), conc=64: 4727 (+1%)
+  - FP8 is most effective in deeply memory-bound regime (low concurrency)
+  - At conc=32 (memory-bound→compute transition), FP8 benefit diminishes to zero
+- **FP8 quality — all pass**:
+  - GSM8K: 95.5%, HumanEval: 89.6%, MBPP: 93.4%, MATH-500: 89.0%
+  - IFEval inst-strict: 89.21% (slightly better than bf16's 88.73%)
+- **TP=2 evaluated (4 servers, 2 GPUs each)**:
+  - Per-server: conc=1 +24%, conc=32 -3%, conc=64 +13%
+  - Fleet throughput halved → NOT recommended
+- **FP8 recommended as default** — add `--quantization fp8` to launch command
+- **No code changes** — FP8 is a deployment configuration, not a code change
+
+### Why FP8 doesn't help at conc=32
+- FP8 halves weight reads (8GB vs 16GB) → faster when memory-bound
+- At conc=1 (5 batch tokens, deeply memory-bound): weight read dominates → 34% speedup
+- At conc=32 (160 batch tokens, near memory-compute crossover ~295):
+  - FP8 reduces memory time but compute is already significant
+  - FP8 tensor core throughput is 2x BF16, but dequantization overhead + reduced precision compute means less net benefit
+  - Net result: ~0% change
+- At conc=64 (320 batch tokens, past crossover): compute-bound, FP8's 2x tensor core throughput gives slight +1%
+
 ## Evaluator Feedback (Iteration 1)
 1. Fix test execution: activate conda env with `. /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang` (use dot not source for sh), combine multi-line commands into single shell invocations, and pass ports as explicit args (`--ports 30000 30001 30002 30003 30004 30005 30006 30007`). 2. Focus on closing the conc=32 gap (3,188 vs 5,000 target = 37% shortfall) — this is the hardest criterion. Implement the fused Triton verify+sample kernel (Phase 3) to reduce the 9.27ms verify+sample to <5ms. 3. Implement overlap scheduling (Phase 4) to hide verify+sample behind GPU forward. 4. For conc=1, N=3 or N=4 gives >= 200 tok/s but N=2 gives 177 — consider using adaptive N selection based on concurrency, or optimize N=2 bs=1 path. 5. Run quality benchmarks for N=2 (GSM8K, HumanEval, MBPP, IFEval) before further throughput optimization.
 
@@ -299,3 +379,7 @@ Logs emit every 500 forwards to `/tmp/sglang_gpu{N}.log`. Accept rates:
 
 ## Evaluator Feedback (Iteration 4)
 1. The 25% gap at conc=32 is fundamental: block_size=5 means 5x more compute per forward vs EAGLE3's 1 token. The plan correctly identifies this. The only paths forward are: (a) Train a block_size=3 model (N=2, 3 input tokens per forward). (b) Implement selective lm_head: skip lm_head for positions where logits won't change the outcome. (c) Implement batch-level adaptive N: automatically switch to N=2 when running_requests > 24. This requires dual CUDA graph capture but the plan dismissed it too quickly — the +25% throughput gain at conc=32 justifies the complexity. 2. Fix test execution. 3. TPF logs were empty in test output — ensure TPF logging emits during benchmarks. 4. If training a new model is out of scope, document clearly that the conc=32/64 throughput targets require a smaller block_size model.
+
+
+## Evaluator Feedback (Iteration 5)
+The plan conclusively demonstrates the conc=32/64 gap is architectural (self-drafting 5 tokens with full 8B model vs EAGLE3's external draft model). Software overhead is already minimized (forward=90%+ of step time). Actionable paths: (1) FP8 quantization: halves weight reads in memory-bound regime, expected ~2x speedup at conc=32 → ~6000+ tok/s. This is the highest-ROI change requiring no model retraining. Implement W8A8 or W8A16 quantization for the model weights. (2) TP=2 per server (4 servers on 8 GPUs): halves memory-bound time per forward, expected ~2x at conc=32. Trade GPU count for per-server throughput. (3) Train a block_size=3 (N=2) model optimized for high-concurrency: 3 input tokens instead of 5, reduces compute at compute-bound regime. (4) Implement speculative decoding with an external small draft model (~100M params) instead of self-drafting, fundamentally matching EAGLE3's architecture. Priority: try FP8 quantization first as it requires no model changes and directly addresses the memory-bandwidth bottleneck.
