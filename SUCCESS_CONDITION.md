@@ -1,80 +1,92 @@
 # Success Conditions
 
-## Primary Metric: tore-speed-eval (sampling verify mode)
+## Primary Metric: TP=4 throughput (tore-speed-eval)
 
-All performance numbers come from `tore-speed-eval` with sampling verify configs (temperature=1.0).
+All performance numbers come from `tore-speed-eval` with AIME dataset, burst mode.
 
 ```bash
 source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
+TOKENIZER=/data/yjian/models/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
 tore-speed-eval --provider sglang --base_url http://localhost:30000/v1 \
-  --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent \
-  --concurrency <CONCURRENCY> --num_examples 100 --dataset_type synthetic \
-  --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048
+  --model_name default --tokenizer_name $TOKENIZER --traffic_pattern burst \
+  --concurrency <C> --num_examples 90 --max_tokens 2048 \
+  --dataset_type jsonl --jsonl_input_path /tmp/aime2024.jsonl \
+  --jsonl_convert_to_chat_request_format true \
+  --temperature 1.0 --top_p 0.95
 ```
 
 ## Criteria
 
-### 1. Throughput: Match or exceed EAGLE3 with sampling verify
-- concurrency=32: Job-level tok/s **>= 5000** (EAGLE3 = 5103, current sampling = 3568)
-- concurrency=64: Job-level tok/s **>= 5600** (EAGLE3 = 5569)
-- Any N from 2-5 is acceptable; find the optimal one
-- Must use sampling verify (temperature=1.0, use_spec_verify=true)
+### 1. TP=4 Throughput: DreamShift must beat Qwen-AR TP=4
+- At ALL concurrency levels (1, 2, 4, 8, 16, 32, 64), DreamShift TP=4 tok/s > Qwen-AR TP=4 tok/s
+- At low concurrency (C=1): significant speedup expected (2x+ over Qwen-AR)
+- At high concurrency (C=64): at least match Qwen-AR
 
-### 2. Throughput: bs=1 advantage maintained
-- concurrency=1: Job-level tok/s **>= 200** (current sampling = ~288)
+### 2. Single request latency: maximize bs=1 output tok/s
+- TP=4 DreamShift at C=1 should significantly exceed TP=1 (current best: 328 tok/s with N=5 fp8)
+- Target: **>= 700 tok/s** at C=1 (stretch goal)
+- Minimum: >= 500 tok/s at C=1
 
-### 3. TTFT: Low latency
-- TTFT median < 100ms at concurrency=1
-- TTFT median < 500ms at concurrency=32
+### 3. Max throughput: find the peak
+- Find the concurrency level that maximizes total throughput for TP=4 DreamShift
+- Document the peak and compare with Qwen-AR TP=4 peak
 
-### 4. Quality: Must be preserved (sampling verify)
-- GSM8K (200 problems, max_tokens=8192): **>= 90%**
-- HumanEval (164 problems, max_tokens=8192): **>= 85%**
-- MBPP (257 problems, max_tokens=16384): **>= 80%**
-- IFEval (541 prompts, max_tokens=8192): strict **>= 80%**
+### 4. Quality: Must be preserved
+- **Quick iteration (use these first)**: IFEval strict >= 80%, GSM8K (200Q) >= 90%
+- **Full validation (later)**: HumanEval >= 85%, MBPP >= 80%, AIME 2024 >= 73%
+- IFEval and GSM8K are fast (~2-5 min); use them for rapid quality checks during optimization
+- AIME takes 10+ minutes per run; save for final validation only
 - 0 failed requests in all benchmarks
-- IMPORTANT: always use max_tokens >= 8192 (16384 for MBPP). Truncation causes false failures.
-- If accuracy seems low, check if outputs are truncated (no </think>, no \boxed{}) before assuming algorithm bug.
+- IMPORTANT: always use max_tokens >= 8192 (32768 for AIME). Truncation causes false failures.
 
 ### 5. Algorithm health: TPF and accept rate
 - Check server logs: `strings /tmp/sglang_gpu0.log | grep "tok/fwd"`
-- N=2: TPF >= 1.3
-- N=3: TPF >= 1.8
-- N=4: TPF >= 2.0
-- Accept rate >= 40% for all N values
+- N=3: TPF >= 1.8, accept rate >= 40%
+- N=5: TPF >= 2.5, accept rate >= 30%
 
 ## Test Commands
 
-### Setup: Kill old servers, launch with chosen config
+### Setup: Launch TP=4 DreamShift server
 ```bash
-bash scripts/killall_sglang.sh
-sleep 3
-CONFIG=dreamshift_blockN3_config.yaml bash scripts/launch_blockN_8gpu.sh
+bash scripts/killall_sglang.sh && sleep 3
+export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
+export CUDA_HOME=/usr/local/cuda-12.9
+SDAR=/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont
+
+# TP=4 DreamShift N=3 sample on GPUs 0-3
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
+  --model-path $SDAR --trust-remote-code --tp-size 4 \
+  --mem-fraction-static 0.85 --max-running-requests 128 \
+  --attention-backend flashinfer --dllm-algorithm DreamShiftBlockN \
+  --dllm-algorithm-config dreamshift_blockN3_config.yaml \
+  --dtype bfloat16 --port 30000 --chunked-prefill-size 4096
 ```
 
-### Quick sanity check
+### Throughput benchmarks
 ```bash
-python scripts/stream_demo.py --url http://localhost:30000 --prompt 'What is 15*23+7?' --max-tokens 256
-```
-
-### Throughput benchmarks (vary concurrency)
-```bash
-for C in 1 4 8 16 32 64; do
+TOKENIZER=/data/yjian/models/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+for C in 1 2 4 8 16 32 64; do
   echo "=== concurrency=$C ==="
   tore-speed-eval --provider sglang --base_url http://localhost:30000/v1 \
-    --model_name default --tokenizer_name Qwen/Qwen3-8B --traffic_pattern concurrent \
-    --concurrency $C --num_examples 100 --dataset_type synthetic \
-    --synthetic_input_length 256 --synthetic_output_length 1024 --max_tokens 2048
+    --model_name default --tokenizer_name $TOKENIZER --traffic_pattern burst \
+    --concurrency $C --num_examples 90 --max_tokens 2048 \
+    --dataset_type jsonl --jsonl_input_path /tmp/aime2024.jsonl \
+    --jsonl_convert_to_chat_request_format true \
+    --temperature 1.0 --top_p 0.95
 done
 ```
 
-### Quality benchmarks (use all 8 GPUs)
+### Quality benchmarks (use 2x TP=4 servers on ports 30000 and 30004)
 ```bash
-PORTS="30000 30001 30002 30003 30004 30005 30006 30007"
+PORTS="30000 30004"
+# Quick iteration (use these first, ~2-5 min each):
+python scripts/eval_ifeval.py --ports $PORTS --max-tokens 8192
 python scripts/eval_gsm8k.py --ports $PORTS --num-problems 200 --max-tokens 8192
+
+# Full validation (later, when optimization is stable):
 python scripts/eval_humaneval.py --ports $PORTS --max-tokens 8192
 python scripts/eval_mbpp.py --ports $PORTS --max-tokens 16384
-python scripts/eval_ifeval.py --ports $PORTS --max-tokens 8192
+python scripts/eval_aime.py --year 2024 --ports $PORTS --max-tokens 32768 --temperature 1.0 --top-p 0.95 --top-k 50 --output-dir /tmp/aime_tp4
 ```
 
 ### TPF check
@@ -86,14 +98,16 @@ strings /tmp/sglang_gpu0.log | grep "tok/fwd" | tail -5
 When performance doesn't meet targets:
 1. **Profile first**: `POST /start_profile` to capture GPU traces
 2. **Parse traces**: Use Python trace parser to find top time consumers
-3. **Check batch utilization**: `strings /tmp/sglang_gpu0.log | grep "DLLM decode loop"`
-4. **Check TPF**: If TPF drops, the algorithm logic may be broken
-5. **Check quality**: Run GSM8K 30Q quick test before full benchmark
-6. Only after quantitative understanding, attempt a fix
+3. **Check NCCL overhead**: Look for `nccl` in traces, measure all-reduce time vs compute time
+4. **Check batch utilization**: `strings /tmp/sglang_gpu0.log | grep "DLLM decode loop"`
+5. **Check TPF**: If TPF drops, the algorithm logic may be broken
+6. **Check quality**: Run AIME quick test (--num-problems 10) before full benchmark
+7. Only after quantitative understanding, attempt a fix
 
 ## Notes
-- EAGLE3 becomes compute-bound at conc>=48 (1.03x over AR at conc=64). This is where DreamShiftBlockN should win.
-- Sampling verify is slower than greedy due to: (a) lower accept rate 60% vs 89%, (b) softmax+multinomial per rejection
-- The main optimization vectors are: reducing per-step CPU overhead, improving batch efficiency, writing fused kernels
-- Large architectural changes are encouraged: new scheduler modes, overlap scheduling, custom kernels
+- TP=4 reduces per-GPU compute by ~4x but adds NCCL all-reduce communication
+- At low concurrency (memory-bound), TP=4 may not help much since the bottleneck is weight loading
+- At high concurrency (compute-bound), TP=4 should scale well
+- DreamShift's verify/sample operations happen AFTER forward pass — they don't need TP communication
+- The `lm_head` output is already gathered on each rank — verify can happen on rank 0 only
 - Reference implementation: `/data/cxu/dllm-distillation/generate.py` `causal_blockN_spec_verified_generate_with_shift`

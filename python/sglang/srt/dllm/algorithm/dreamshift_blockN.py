@@ -270,15 +270,21 @@ class DreamShiftBlockN(DllmAlgorithm):
         # Detect inline prefill requests (extend_len != blk)
         is_prefill = [extend_lens_cpu[bid] != blk for bid in range(batch_size)]
 
-        # Determine if batch has any MASK tokens (decode vs prefill)
-        # Combine req_pool_indices and seq_lens into a single tolist() to reduce GPU→CPU syncs
-        _combined = torch.cat([
-            forward_batch.req_pool_indices[:batch_size],
-            forward_batch.seq_lens[:batch_size].to(forward_batch.req_pool_indices.dtype),
-        ])
-        _combined_cpu = _combined.tolist()
-        req_pool_indices_cpu = _combined_cpu[:batch_size]
-        seq_lens_cpu = [int(x) for x in _combined_cpu[batch_size:]]
+        # Use cached CPU values from prepare_for_dllm_decode when available
+        # (avoids GPU→CPU sync via torch.cat + tolist)
+        _cached_rpx = getattr(forward_batch, 'dllm_rpx_cpu', None)
+        if _cached_rpx is not None and len(_cached_rpx) == batch_size:
+            req_pool_indices_cpu = _cached_rpx
+            seq_lens_cpu = forward_batch.dllm_seq_lens_cpu
+        else:
+            # Fallback: GPU→CPU sync (first forward or non-decode-loop)
+            _combined = torch.cat([
+                forward_batch.req_pool_indices[:batch_size],
+                forward_batch.seq_lens[:batch_size].to(forward_batch.req_pool_indices.dtype),
+            ])
+            _combined_cpu = _combined.tolist()
+            req_pool_indices_cpu = _combined_cpu[:batch_size]
+            seq_lens_cpu = [int(x) for x in _combined_cpu[batch_size:]]
         # In decode loop, extend_lens contain blk-sized entries (decode requests)
         # which always have MASKs. Skip the GPU sync for mask check.
         if any(el == blk for el in extend_lens_cpu):
@@ -451,6 +457,8 @@ class DreamShiftBlockN(DllmAlgorithm):
         all_corr_tokens_gpu = None
         all_sample_ids_gpu = None
         draft_probs_all = None
+        if self._timing_enabled:
+            _t_vs_start = time.perf_counter()
 
         if self.use_spec_verify and verify_bids:
             nv = len(verify_bids)
@@ -551,6 +559,9 @@ class DreamShiftBlockN(DllmAlgorithm):
                     corrected_dist, num_samples=1
                 ).squeeze(1)
 
+        if self._timing_enabled:
+            _t_vs_after_verify = time.perf_counter()
+
         # Speculative sampling for ALL verify + cold bids (before knowing verify results)
         if sample_logit_indices:
             all_sample_logits = full_logits[
@@ -571,6 +582,9 @@ class DreamShiftBlockN(DllmAlgorithm):
                     draft_logits = draft_logits / self.temperature
                 draft_probs_all = F.softmax(draft_logits, dim=-1)
 
+        if self._timing_enabled:
+            _t_vs_after_sample = time.perf_counter()
+
         # --- Single GPU→CPU sync: pack everything ---
         gpu_parts = []
         verify_len = 0
@@ -588,6 +602,9 @@ class DreamShiftBlockN(DllmAlgorithm):
             _mega_cpu = _mega_packed.tolist()
         else:
             _mega_cpu = []
+
+        if self._timing_enabled:
+            _t_vs_after_sync = time.perf_counter()
 
         # --- CPU unpack ---
         if verify_len > 0:
@@ -649,7 +666,7 @@ class DreamShiftBlockN(DllmAlgorithm):
         all_trim_pos = []
         for bid in decode_bids:
             rpx = req_pool_indices_cpu[bid]
-            sl = int(seq_lens_cpu[bid])
+            sl = seq_lens_cpu[bid]
             tc = trim_counts[bid]
             for t in range(tc):
                 all_trim_rpx.append(rpx)
@@ -782,6 +799,13 @@ class DreamShiftBlockN(DllmAlgorithm):
             self._timing["phase2_forward"] += (_t_phase2_end - _t_phase1_end)
             self._timing["phase3_verify_sample"] += (_t_phase3_end - _t_phase2_end)
             self._timing["phase4_trim_assemble"] += (_t_run_end - _t_phase3_end)
+            # Micro-timing for verify_sample breakdown
+            self._timing.setdefault("vs_verify_gpu", 0.0)
+            self._timing.setdefault("vs_sample_gpu", 0.0)
+            self._timing.setdefault("vs_sync", 0.0)
+            self._timing["vs_verify_gpu"] += (_t_vs_after_verify - _t_vs_start)
+            self._timing["vs_sample_gpu"] += (_t_vs_after_sample - _t_vs_after_verify)
+            self._timing["vs_sync"] += (_t_vs_after_sync - _t_vs_after_sample)
             self._timing["timing_count"] += 1
         if self._stats["total_forwards"] % 500 == 0:
             s = self._stats
@@ -797,10 +821,17 @@ class DreamShiftBlockN(DllmAlgorithm):
             if self._timing_enabled:
                 t = self._timing
                 tc = max(t["timing_count"], 1)
+                vs_detail = ""
+                if t.get("vs_verify_gpu"):
+                    vs_detail = (
+                        f" [verify_gpu={t['vs_verify_gpu']/tc*1000:.2f}"
+                        f" sample_gpu={t['vs_sample_gpu']/tc*1000:.2f}"
+                        f" sync={t['vs_sync']/tc*1000:.2f}]"
+                    )
                 timing_str = (
                     f" timing(ms): classify={t['phase1_classify']/tc*1000:.2f} "
                     f"forward={t['phase2_forward']/tc*1000:.2f} "
-                    f"verify_sample={t['phase3_verify_sample']/tc*1000:.2f} "
+                    f"verify_sample={t['phase3_verify_sample']/tc*1000:.2f}{vs_detail} "
                     f"trim_assemble={t['phase4_trim_assemble']/tc*1000:.2f}"
                 )
             logger.info(

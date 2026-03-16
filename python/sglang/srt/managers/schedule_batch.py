@@ -2130,7 +2130,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         self.out_cache_loc = out_cache_loc
 
-        # 6. Update per-request memory fields
+        # 6. Cache CPU-side values so the algorithm can skip GPU→CPU syncs
+        self._dllm_rpx_cpu = rpx_list
+        self._dllm_seq_lens_cpu = seq_lens
+
+        # 7. Update per-request memory fields
         for i, req in enumerate(self.reqs):
             req.kv_committed_len = seq_lens[i]
             req.kv_allocated_len = seq_lens[i]
@@ -2339,6 +2343,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            dllm_rpx_cpu=getattr(self, '_dllm_rpx_cpu', None),
+            dllm_seq_lens_cpu=getattr(self, '_dllm_seq_lens_cpu', None),
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2518,6 +2524,9 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+    # Cached CPU values from prepare_for_dllm_decode (avoids GPU→CPU sync in algorithm)
+    dllm_rpx_cpu: Optional[List[int]] = None
+    dllm_seq_lens_cpu: Optional[List[int]] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

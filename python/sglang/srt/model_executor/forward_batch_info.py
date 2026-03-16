@@ -532,6 +532,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # Pass through DLLM CPU cache to avoid GPU→CPU sync in algorithm
+        if getattr(batch, 'dllm_rpx_cpu', None) is not None:
+            ret.dllm_rpx_cpu = batch.dllm_rpx_cpu
+            ret.dllm_seq_lens_cpu = batch.dllm_seq_lens_cpu
+
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
