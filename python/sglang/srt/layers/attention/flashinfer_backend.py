@@ -788,8 +788,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
-            import time as _time
-            _tm0 = _time.perf_counter()
+            # Use standard path (the inlined path had CUDA graph padding issues)
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -801,13 +800,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
-            _tm1 = _time.perf_counter()
-            _md_times = getattr(self, '_dllm_metadata_times', [])
-            _md_times.append(_tm1 - _tm0)
-            self._dllm_metadata_times = _md_times
-            if len(_md_times) % 500 == 0:
-                avg = sum(_md_times[-500:]) / 500 * 1e6
-                logger.info(f"[DLLM metadata] avg={avg:.0f}us")
         else:
             raise ValueError("Invalid forward mode")
 

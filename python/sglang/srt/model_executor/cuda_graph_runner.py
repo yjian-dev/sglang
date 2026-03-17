@@ -980,11 +980,86 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def replay_prepare_early(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """Early metadata preparation: attention backend + seq_lens + positions.
+        Can be called before input_ids are finalized (e.g., during overlap window).
+        Only updates metadata that doesn't depend on input_ids content."""
+        buffers = self.buffers
+        self.recapture_if_needed(forward_batch)
+
+        raw_bs = forward_batch.batch_size
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                else max_num_tokens
+            )
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+
+        # Copy seq_lens, positions, req_pool_indices (don't depend on input_ids)
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens[:raw_bs])
+        if raw_bs < bs:
+            buffers.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+        if hasattr(buffers, 'seq_lens_cpu') and forward_batch.seq_lens_cpu is not None:
+            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
+            if raw_bs < bs:
+                buffers.seq_lens_cpu[raw_bs:bs].fill_(self.seq_len_fill_value)
+        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices[:raw_bs])
+        if forward_batch.positions is not None:
+            buffers.positions[:raw_num_token].copy_(forward_batch.positions[:raw_num_token])
+        if forward_batch.out_cache_loc is not None:
+            buffers.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc[:raw_num_token])
+
+        # Attention backend metadata (the expensive part: ~0.43ms)
+        if self.enable_pdmux:
+            stream_idx = get_current_stream_idx()
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+        else:
+            attn_backend = self.model_runner.attn_backend
+        attn_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            buffers.req_pool_indices[:bs],
+            buffers.seq_lens[:bs],
+            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+            self.capture_forward_mode,
+            forward_batch.spec_info,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        )
+
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+        self._early_prepared = True
+
+    def replay_prepare_late(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        """Late preparation: copy input_ids into CUDA graph buffers.
+        Must be called after input_ids are finalized by classify."""
+        buffers = self.buffers
+        # Only copy input_ids (the content that classify changes)
+        buffers.input_ids[:self.raw_num_token].copy_(forward_batch.input_ids[:self.raw_num_token])
+        self._early_prepared = False
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        """Full preparation (non-pipelined path)."""
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
 
@@ -1049,6 +1124,7 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self._early_prepared = False
 
     def replay(
         self,

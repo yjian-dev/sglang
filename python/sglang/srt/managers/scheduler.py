@@ -1257,11 +1257,6 @@ class Scheduler(
                     _overlap_recv_reqs = self.recv_requests()
                     _recv_done = True
 
-                def _overlap_fn():
-                    nonlocal _recv_done, _overlap_recv_reqs
-                    _overlap_recv_reqs = self.recv_requests()
-                    _recv_done = True
-
                 model_worker_batch._dllm_overlap_fn = _overlap_fn
                 with self.record_forward_metrics(batch):
                     result = self.model_worker.forward_batch_generation(
