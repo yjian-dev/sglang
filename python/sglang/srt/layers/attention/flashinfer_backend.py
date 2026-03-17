@@ -788,17 +788,51 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
-            # Use standard path (the inlined path had CUDA graph padding issues)
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                prefix_lens=seq_lens[:bs] - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=None,
+            # Inlined fast path: skip update_single_wrapper → call_begin_forward chain
+            _upd = self.indices_updater_prefill
+            _blk = self.dllm_config.block_size
+            _sl = seq_lens[:bs]
+            _rpi = req_pool_indices[:bs]
+            # Clamp prefix_lens to avoid negative values for CUDA graph padding entries
+            # (padded entries have seq_lens=1, so 1-block_size would be negative)
+            _prefix = torch.clamp(_sl - _blk, min=0)
+            _wrapper = self.prefill_cuda_graph_metadata[bs][0]
+
+            # kv_indptr (paged_kernel_lens = seq_lens since use_ragged=False)
+            _kv_indptr = _upd.kv_indptr[0]
+            _kv_indptr[1:bs+1] = torch.cumsum(_sl, dim=0)
+            _kv_indptr_slice = _kv_indptr[:bs+1]
+
+            # kv_indices (reuse buffer)
+            _needed = seq_lens_sum + 256
+            _kv_buf = getattr(_upd, '_kv_indices_buf', None)
+            if _kv_buf is not None and _kv_buf.shape[0] >= _needed:
+                _kv_indices = _kv_buf
+            else:
+                _kv_indices = torch.empty(
+                    max(_needed, 8192), dtype=torch.int32, device=_rpi.device,
+                )
+                _upd._kv_indices_buf = _kv_indices
+
+            create_flashinfer_kv_indices_triton[(bs,)](
+                _upd.req_to_token, _rpi, _sl, _kv_indptr_slice,
+                None, _kv_indices, _upd.req_to_token.shape[1],
+            )
+
+            # qo_indptr
+            _qo_indptr = _upd.qo_indptr[0]
+            _qo_indptr[1:bs+1] = torch.cumsum(_sl - _prefix, dim=0)
+            _qo_indptr_slice = _qo_indptr[:bs+1]
+
+            # begin_forward (plan)
+            _wrapper.begin_forward(
+                _qo_indptr_slice, _kv_indptr_slice, _kv_indices,
+                _upd.kv_last_page_len[:bs],
+                _upd.num_qo_heads, _upd.num_kv_heads, _upd.head_dim,
+                1,  # page_size
+                q_data_type=_upd.q_data_type,
+                kv_data_type=_upd.data_type,
+                non_blocking=True,
             )
         else:
             raise ValueError("Invalid forward mode")
