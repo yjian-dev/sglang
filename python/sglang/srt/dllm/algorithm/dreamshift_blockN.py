@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 
 try:
-    from sglang.srt.dllm.algorithm.fused_verify_kernel import fused_spec_verify
+    from sglang.srt.dllm.algorithm.fused_verify_kernel import fused_spec_verify, fused_spec_verify_from_logits
     _HAS_FUSED_VERIFY = True
 except ImportError:
     _HAS_FUSED_VERIFY = False
@@ -83,11 +83,13 @@ def _batched_sample(
     If return_probs=True, also returns the full probs [N, vocab_size] matrix.
     """
     if temperature <= 0:
-        probs = F.softmax(logits, dim=-1)
-        token_ids = probs.argmax(dim=-1)
-        token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        token_ids = logits.argmax(dim=-1)
         if return_probs:
+            probs = F.softmax(logits, dim=-1)
+            token_probs = probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
             return token_ids, token_probs, probs
+        # Skip softmax when probs aren't needed (greedy path)
+        token_probs = torch.ones(token_ids.shape[0], device=logits.device)
         return token_ids, token_probs
 
     scaled = logits if temperature == 1.0 else logits / temperature
@@ -189,6 +191,8 @@ class DreamShiftBlockN(DllmAlgorithm):
 
         # Per-request state (keyed by req_pool_idx)
         self._prev_last_logits: Dict[int, torch.Tensor] = {}
+        # Greedy shortcut: store argmax token id directly instead of full logits
+        self._prev_last_argmax: Dict[int, int] = {}
         self._pending: Dict[int, int] = {}
         self._spec_tokens: Dict[int, List[int]] = {}
         # Store full draft probability distributions for correct max(0, p-q) correction.
@@ -219,7 +223,7 @@ class DreamShiftBlockN(DllmAlgorithm):
             "phase4_trim_assemble": 0.0,
             "timing_count": 0,
         }
-        self._timing_enabled = False  # Set True for profiling
+        self._timing_enabled = False  # Set True for profiling (adds GPU sync overhead!)
         logger.info(
             f"[DreamShiftBlockN] gen_block_size={self.gen_block_size}, "
             f"block_size={self.block_size}, num_masks={self.num_masks}, "
@@ -234,6 +238,7 @@ class DreamShiftBlockN(DllmAlgorithm):
         being picked up by a new request that reuses the same req_pool_idx.
         """
         self._prev_last_logits.pop(req_pool_idx, None)
+        self._prev_last_argmax.pop(req_pool_idx, None)
         self._pending.pop(req_pool_idx, None)
         self._spec_tokens.pop(req_pool_idx, None)
         self._spec_draft_probs.pop(req_pool_idx, None)
@@ -361,14 +366,20 @@ class DreamShiftBlockN(DllmAlgorithm):
                     t0_tokens.append(forced)
                     was_forced[bid] = True
                 else:
-                    prev = self._prev_last_logits.get(rpx)
-                    if prev is not None:
-                        pre_sample_logits.append(prev)
-                        pre_sample_bids.append(bid)
-                        t0_tokens.append(None)
+                    # Greedy shortcut: use cached argmax directly (no GPU tensor needed)
+                    cached_argmax = self._prev_last_argmax.pop(rpx, None)
+                    if cached_argmax is not None:
+                        forward_batch.input_ids[base] = cached_argmax
+                        t0_tokens.append(cached_argmax)
                     else:
-                        forward_batch.input_ids[base] = self.mask_id
-                        t0_tokens.append(self.mask_id)
+                        prev = self._prev_last_logits.get(rpx)
+                        if prev is not None:
+                            pre_sample_logits.append(prev)
+                            pre_sample_bids.append(bid)
+                            t0_tokens.append(None)
+                        else:
+                            forward_batch.input_ids[base] = self.mask_id
+                            t0_tokens.append(self.mask_id)
                 case_types.append('C')
 
         # Batched pre-forward sampling for cold start t0
@@ -460,130 +471,178 @@ class DreamShiftBlockN(DllmAlgorithm):
         if self._timing_enabled:
             _t_vs_start = time.perf_counter()
 
-        if self.use_spec_verify and verify_bids:
-            nv = len(verify_bids)
+        # ── Fused greedy path: single gather + argmax for verify+sample ──
+        if self.temperature <= 0 and not self.fast_verify:
+            nv = len(verify_bids) if (self.use_spec_verify and verify_bids) else 0
 
+            # Build combined index list: [verify_indices... | sample_indices...]
             all_gather_idx = []
             all_spec_vals = []
-            all_draft_prob_list = []
-            for bid in verify_bids:
-                base = base_offsets[bid]
-                for si in range(vns):
-                    all_gather_idx.append(base + si)
-                    all_spec_vals.append(old_specs[bid][si])
-                    all_draft_prob_list.append(old_draft_probs[bid][si])
-
-            all_clean_logits = full_logits[
-                torch.tensor(all_gather_idx, dtype=torch.long, device=device)
-            ]
-            all_spec_vals_t = torch.tensor(
-                all_spec_vals, dtype=torch.long, device=device
-            )
-
-            if self.fast_verify:
-                spec_logit_vals = all_clean_logits.gather(
-                    1, all_spec_vals_t.unsqueeze(1)
-                ).squeeze(1)
-
-                if self.fast_verify_topk_per_spec and vns > 1:
-                    per_spec_topk = self.fast_verify_topk_per_spec
-                    all_accepted_gpu = torch.zeros(nv * vns, dtype=torch.bool, device=device)
+            if nv > 0:
+                for bid in verify_bids:
+                    base = base_offsets[bid]
                     for si in range(vns):
-                        k = per_spec_topk[si] if si < len(per_spec_topk) else self.fast_verify_topk
-                        si_indices = list(range(si, nv * vns, vns))
-                        si_logits = all_clean_logits[si_indices]
-                        si_spec_vals = spec_logit_vals[si_indices]
-                        topk_vals_si, _ = si_logits.topk(k, dim=-1)
-                        thresholds_si = topk_vals_si[:, -1]
-                        accepted_si = si_spec_vals >= thresholds_si
-                        for j, idx in enumerate(si_indices):
-                            all_accepted_gpu[idx] = accepted_si[j]
+                        all_gather_idx.append(base + si)
+                        all_spec_vals.append(old_specs[bid][si])
+
+            verify_count = len(all_gather_idx)  # nv * vns
+            combined_indices = all_gather_idx + sample_logit_indices
+
+            if combined_indices:
+                # Single gather + single argmax for everything
+                combined_logits = full_logits[
+                    torch.tensor(combined_indices, dtype=torch.long, device=device)
+                ]
+                combined_argmax = combined_logits.argmax(dim=-1)
+
+                # Split results
+                if verify_count > 0:
+                    all_corr_tokens_gpu = combined_argmax[:verify_count]
+                    all_spec_vals_t = torch.tensor(
+                        all_spec_vals, dtype=torch.long, device=device
+                    )
+                    all_accepted_gpu = all_spec_vals_t == all_corr_tokens_gpu
+
+                if sample_logit_indices:
+                    all_sample_ids_gpu = combined_argmax[verify_count:]
+
+            if self._timing_enabled:
+                _t_vs_after_verify = time.perf_counter()
+                _t_vs_after_sample = time.perf_counter()
+        else:
+            # ── Non-greedy path: separate verify + sample ──
+            if self.use_spec_verify and verify_bids:
+                nv = len(verify_bids)
+
+                all_gather_idx = []
+                all_spec_vals = []
+                all_draft_prob_list = []
+                _need_draft_probs = (
+                    self.temperature > 0
+                    and not self.fast_verify
+                )
+                for bid in verify_bids:
+                    base = base_offsets[bid]
+                    for si in range(vns):
+                        all_gather_idx.append(base + si)
+                        all_spec_vals.append(old_specs[bid][si])
+                        if _need_draft_probs:
+                            all_draft_prob_list.append(old_draft_probs[bid][si])
+
+                all_clean_logits = full_logits[
+                    torch.tensor(all_gather_idx, dtype=torch.long, device=device)
+                ]
+                all_spec_vals_t = torch.tensor(
+                    all_spec_vals, dtype=torch.long, device=device
+                )
+
+                if self.fast_verify:
+                    spec_logit_vals = all_clean_logits.gather(
+                        1, all_spec_vals_t.unsqueeze(1)
+                    ).squeeze(1)
+
+                    if self.fast_verify_topk_per_spec and vns > 1:
+                        per_spec_topk = self.fast_verify_topk_per_spec
+                        all_accepted_gpu = torch.zeros(nv * vns, dtype=torch.bool, device=device)
+                        for si in range(vns):
+                            k = per_spec_topk[si] if si < len(per_spec_topk) else self.fast_verify_topk
+                            si_indices = list(range(si, nv * vns, vns))
+                            si_logits = all_clean_logits[si_indices]
+                            si_spec_vals = spec_logit_vals[si_indices]
+                            topk_vals_si, _ = si_logits.topk(k, dim=-1)
+                            thresholds_si = topk_vals_si[:, -1]
+                            accepted_si = si_spec_vals >= thresholds_si
+                            for j, idx in enumerate(si_indices):
+                                all_accepted_gpu[idx] = accepted_si[j]
+                    else:
+                        topk_vals, _ = all_clean_logits.topk(
+                            self.fast_verify_topk, dim=-1
+                        )
+                        topk_thresholds = topk_vals[:, -1]
+                        all_accepted_gpu = spec_logit_vals >= topk_thresholds
+                    all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
+                elif _HAS_FUSED_VERIFY and self.verify_alpha > 0:
+                    # Fused Triton kernel: softmax + ratio + Gumbel-max correction
+                    all_draft_probs_t = torch.stack(all_draft_prob_list)
+                    self._gumbel_seed_counter += 1
+                    all_accepted_gpu, all_corr_tokens_gpu = fused_spec_verify(
+                        all_clean_logits, all_draft_probs_t, all_spec_vals_t,
+                        temperature=self.temperature,
+                        alpha=self.verify_alpha,
+                        gumbel_seed=self._gumbel_seed_counter,
+                    )
                 else:
-                    topk_vals, _ = all_clean_logits.topk(
-                        self.fast_verify_topk, dim=-1
-                    )
-                    topk_thresholds = topk_vals[:, -1]
-                    all_accepted_gpu = spec_logit_vals >= topk_thresholds
-                all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
-            elif self.temperature <= 0:
-                all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
-                all_accepted_gpu = all_spec_vals_t == all_corr_tokens_gpu
-            elif _HAS_FUSED_VERIFY and self.verify_alpha > 0:
-                # Fused Triton kernel: softmax + ratio + Gumbel-max correction
-                all_draft_probs_t = torch.stack(all_draft_prob_list)
-                self._gumbel_seed_counter += 1
-                all_accepted_gpu, all_corr_tokens_gpu = fused_spec_verify(
-                    all_clean_logits, all_draft_probs_t, all_spec_vals_t,
-                    temperature=self.temperature,
-                    alpha=self.verify_alpha,
-                    gumbel_seed=self._gumbel_seed_counter,
-                )
-            else:
-                # Standard verify: softmax + p/q ratio + correction
-                if self.temperature != 1.0:
-                    all_clean_logits = all_clean_logits / self.temperature
-                all_clean_probs = F.softmax(all_clean_logits, dim=-1)
+                    # Standard verify: softmax + p/q ratio + correction
+                    if self.temperature != 1.0:
+                        all_clean_logits = all_clean_logits / self.temperature
+                    all_clean_probs = F.softmax(all_clean_logits, dim=-1)
 
-                all_draft_probs_t = torch.stack(all_draft_prob_list)
-                all_p = all_clean_probs.gather(
-                    1, all_spec_vals_t.unsqueeze(1)
-                ).squeeze(1)
-                all_q = all_draft_probs_t.gather(
-                    1, all_spec_vals_t.unsqueeze(1)
-                ).squeeze(1)
-                alpha = self.verify_alpha
-                if alpha <= 0:
-                    all_accepted_gpu = torch.ones(
-                        nv * vns, dtype=torch.bool, device=device
+                    all_draft_probs_t = torch.stack(all_draft_prob_list)
+                    all_p = all_clean_probs.gather(
+                        1, all_spec_vals_t.unsqueeze(1)
+                    ).squeeze(1)
+                    all_q = all_draft_probs_t.gather(
+                        1, all_spec_vals_t.unsqueeze(1)
+                    ).squeeze(1)
+                    alpha = self.verify_alpha
+                    if alpha <= 0:
+                        all_accepted_gpu = torch.ones(
+                            nv * vns, dtype=torch.bool, device=device
+                        )
+                    else:
+                        scaled_q = all_q * alpha
+                        all_ratios = torch.where(
+                            scaled_q > 0, all_p / scaled_q,
+                            torch.zeros_like(all_p),
+                        )
+                        all_rands = torch.rand(nv * vns, device=device)
+                        all_accepted_gpu = (all_ratios >= 1.0) | (
+                            all_rands < all_ratios
+                        )
+                    corrected_dist = torch.clamp(
+                        all_clean_probs - all_draft_probs_t, min=0
                     )
+                    corrected_sums = corrected_dist.sum(dim=-1, keepdim=True)
+                    corrected_dist = torch.where(
+                        corrected_sums > 0,
+                        corrected_dist / corrected_sums,
+                        all_clean_probs,
+                    )
+                    all_corr_tokens_gpu = torch.multinomial(
+                        corrected_dist, num_samples=1
+                    ).squeeze(1)
+
+            if self._timing_enabled:
+                _t_vs_after_verify = time.perf_counter()
+
+            # Speculative sampling for ALL verify + cold bids (before knowing verify results)
+            if sample_logit_indices:
+                all_sample_logits = full_logits[
+                    torch.tensor(sample_logit_indices, dtype=torch.long, device=device)
+                ]
+
+                if self.temperature > 0:
+                    # Sample all positions, then overwrite specs with argmax for better accept rate
+                    all_sample_ids_gpu, _ = _batched_sample(
+                        all_sample_logits, self.temperature, self.top_k, self.top_p
+                    )
+                    # Overwrite spec positions with argmax (they're guesses for next verify)
+                    draft_indices = []
+                    for group_start in range(0, len(sample_logit_indices), gs):
+                        for m in range(num_masks):
+                            draft_indices.append(group_start + 1 + m)
+                    if draft_indices:
+                        draft_logits = all_sample_logits[draft_indices]
+                        all_sample_ids_gpu[draft_indices] = draft_logits.argmax(dim=-1).to(all_sample_ids_gpu.dtype)
+                        scaled_draft = draft_logits if self.temperature == 1.0 else draft_logits / self.temperature
+                        draft_probs_all = F.softmax(scaled_draft, dim=-1)
                 else:
-                    scaled_q = all_q * alpha
-                    all_ratios = torch.where(
-                        scaled_q > 0, all_p / scaled_q,
-                        torch.zeros_like(all_p),
+                    all_sample_ids_gpu, _ = _batched_sample(
+                        all_sample_logits, self.temperature, self.top_k, self.top_p
                     )
-                    all_rands = torch.rand(nv * vns, device=device)
-                    all_accepted_gpu = (all_ratios >= 1.0) | (
-                        all_rands < all_ratios
-                    )
-                corrected_dist = torch.clamp(
-                    all_clean_probs - all_draft_probs_t, min=0
-                )
-                corrected_sums = corrected_dist.sum(dim=-1, keepdim=True)
-                corrected_dist = torch.where(
-                    corrected_sums > 0,
-                    corrected_dist / corrected_sums,
-                    all_clean_probs,
-                )
-                all_corr_tokens_gpu = torch.multinomial(
-                    corrected_dist, num_samples=1
-                ).squeeze(1)
 
-        if self._timing_enabled:
-            _t_vs_after_verify = time.perf_counter()
-
-        # Speculative sampling for ALL verify + cold bids (before knowing verify results)
-        if sample_logit_indices:
-            all_sample_logits = full_logits[
-                torch.tensor(sample_logit_indices, dtype=torch.long, device=device)
-            ]
-            all_sample_ids_gpu, _ = _batched_sample(
-                all_sample_logits, self.temperature, self.top_k, self.top_p
-            )
-
-            # Compute draft probs at spec positions
-            draft_indices = []
-            for group_start in range(0, len(sample_logit_indices), gs):
-                for m in range(num_masks):
-                    draft_indices.append(group_start + 1 + m)
-            if draft_indices:
-                draft_logits = all_sample_logits[draft_indices]
-                if self.temperature > 0 and self.temperature != 1.0:
-                    draft_logits = draft_logits / self.temperature
-                draft_probs_all = F.softmax(draft_logits, dim=-1)
-
-        if self._timing_enabled:
-            _t_vs_after_sample = time.perf_counter()
+            if self._timing_enabled:
+                _t_vs_after_sample = time.perf_counter()
 
         # --- Single GPU→CPU sync: pack everything ---
         gpu_parts = []
@@ -662,19 +721,23 @@ class DreamShiftBlockN(DllmAlgorithm):
                 trim_counts[bid] = blk - 1
                 advances[bid] = 1
 
-        all_trim_rpx = []
-        all_trim_pos = []
-        for bid in decode_bids:
-            rpx = req_pool_indices_cpu[bid]
-            sl = seq_lens_cpu[bid]
-            tc = trim_counts[bid]
-            for t in range(tc):
-                all_trim_rpx.append(rpx)
-                all_trim_pos.append(sl - 1 - t)
-
-        all_kv_indices = None
-        if all_trim_rpx:
+        # Vectorized KV trim index computation (avoid per-element append)
+        total_trim = sum(trim_counts[bid] for bid in decode_bids)
+        if total_trim > 0:
+            all_trim_rpx = [0] * total_trim
+            all_trim_pos = [0] * total_trim
+            _off = 0
+            for bid in decode_bids:
+                rpx = req_pool_indices_cpu[bid]
+                sl = seq_lens_cpu[bid]
+                tc = trim_counts[bid]
+                for t in range(tc):
+                    all_trim_rpx[_off] = rpx
+                    all_trim_pos[_off] = sl - 1 - t
+                    _off += 1
             all_kv_indices = req_to_token[all_trim_rpx, all_trim_pos]
+        else:
+            all_kv_indices = None
 
         # ── Step 4: Assemble outputs ──────────────────────────────
         next_token_ids_list = []
@@ -694,11 +757,18 @@ class DreamShiftBlockN(DllmAlgorithm):
             _logit_save_bids.append(bid)
 
         _saved_logits = {}
+        _saved_argmax = {}  # bid -> argmax token (greedy shortcut)
         if _logit_save_indices:
             _idx_t = torch.tensor(_logit_save_indices, dtype=torch.long, device=device)
-            _all_saved = full_logits[_idx_t].detach().clone()
-            for k, bid in enumerate(_logit_save_bids):
-                _saved_logits[bid] = _all_saved[k]
+            if self.temperature <= 0:
+                # Greedy shortcut: just compute argmax, skip expensive clone
+                _all_argmax = full_logits[_idx_t].argmax(dim=-1).tolist()
+                for k, bid in enumerate(_logit_save_bids):
+                    _saved_argmax[bid] = _all_argmax[k]
+            else:
+                _all_saved = full_logits[_idx_t].detach().clone()
+                for k, bid in enumerate(_logit_save_bids):
+                    _saved_logits[bid] = _all_saved[k]
 
         for bid in range(batch_size):
             rpx = req_pool_indices_cpu[bid]
@@ -725,7 +795,12 @@ class DreamShiftBlockN(DllmAlgorithm):
                 dllm_tokens = [t0_tokens[bid]] + out_pre + [ct]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._force_next_token[rpx] = ct
-                self._prev_last_logits[rpx] = _saved_logits[bid]
+                # Reject path: force_next_token handles t0, but still need logits
+                # for verify round after the forced cold start
+                if bid in _saved_argmax:
+                    self._prev_last_argmax[rpx] = _saved_argmax[bid]
+                else:
+                    self._prev_last_logits[rpx] = _saved_logits[bid]
                 self._stats["reject_count"] += 1
 
             elif case_types[bid] == 'V':
@@ -747,7 +822,10 @@ class DreamShiftBlockN(DllmAlgorithm):
                 self._pending[rpx] = clean_token
                 self._spec_tokens[rpx] = new_spec_tokens
                 self._spec_draft_probs[rpx] = draft_probs_map.get(bid, [])
-                self._prev_last_logits[rpx] = _saved_logits[bid]
+                if bid in _saved_argmax:
+                    self._prev_last_argmax[rpx] = _saved_argmax[bid]
+                else:
+                    self._prev_last_logits[rpx] = _saved_logits[bid]
                 self._stats["accept_count"] += 1
 
             else:
@@ -764,7 +842,10 @@ class DreamShiftBlockN(DllmAlgorithm):
                 self._pending[rpx] = clean_token
                 self._spec_tokens[rpx] = new_spec_tokens
                 self._spec_draft_probs[rpx] = draft_probs_map.get(bid, [])
-                self._prev_last_logits[rpx] = _saved_logits[bid]
+                if bid in _saved_argmax:
+                    self._prev_last_argmax[rpx] = _saved_argmax[bid]
+                else:
+                    self._prev_last_logits[rpx] = _saved_logits[bid]
 
             next_token_ids_list.append(output_tokens)
             self._dllm_write_override[rpx] = dllm_tokens

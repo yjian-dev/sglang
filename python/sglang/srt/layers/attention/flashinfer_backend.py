@@ -788,6 +788,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            import time as _time
+            _tm0 = _time.perf_counter()
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -799,6 +801,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
+            _tm1 = _time.perf_counter()
+            _md_times = getattr(self, '_dllm_metadata_times', [])
+            _md_times.append(_tm1 - _tm0)
+            self._dllm_metadata_times = _md_times
+            if len(_md_times) % 500 == 0:
+                avg = sum(_md_times[-500:]) / 500 * 1e6
+                logger.info(f"[DLLM metadata] avg={avg:.0f}us")
         else:
             raise ValueError("Invalid forward mode")
 
@@ -1458,11 +1467,18 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
+            # Reuse kv_indices buffer to avoid per-step allocation
+            needed = paged_kernel_lens_sum + 256
+            _kv_buf = getattr(self, '_kv_indices_buf', None)
+            if _kv_buf is not None and _kv_buf.shape[0] >= needed:
+                kv_indices = _kv_buf
+            else:
+                kv_indices = torch.empty(
+                    max(needed, 8192),  # over-allocate for growth
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                self._kv_indices_buf = kv_indices
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,

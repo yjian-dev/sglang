@@ -2041,7 +2041,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return False
 
         # 3. Now safe to modify req state
-        input_ids_list = []
+        _pure_decode = all(el == block_size for el in extend_lens)
+        input_ids_list = [] if not _pure_decode else None  # Skip for pure decode
         seq_lens = [0] * bs
         prefix_lens = [0] * bs
         rpx_list = [0] * bs
@@ -2067,31 +2068,78 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.extend_input_len = ext_len
                     req.fill_ids = req.fill_ids[:prefix_len + ext_len]
             if not is_prefill:
-                # Decode: normal path — appends MASKs
-                req.init_next_round_input()
-                req.extend_input_len = min(req.extend_input_len, block_size)
-                # Use kv_committed_len when available (avoids GPU tensor read
-                # from prefix_indices during fast decode loop)
-                prefix_len = getattr(req, 'kv_committed_len', None) or len(req.prefix_indices)
-                req.fill_ids = req.fill_ids[:prefix_len + req.extend_input_len]
+                if _pure_decode:
+                    # Fast path: inline _init_fill_ids_for_dllm + skip set_extend_input_len
+                    advance = (
+                        req.dllm_next_advance
+                        if req.dllm_next_advance is not None
+                        else block_size
+                    )
+                    req.dllm_next_advance = None
+                    req.dllm_block_offset += advance
+                    # Grow dllm_ids (needed by output processor for write_override)
+                    req.dllm_ids += [self.dllm_config.mask_id] * block_size
+                    prefix_len = req.kv_committed_len
+                    req.extend_input_len = block_size
+                else:
+                    # Slow path: full init
+                    req.init_next_round_input()
+                    req.extend_input_len = min(req.extend_input_len, block_size)
+                    prefix_len = getattr(req, 'kv_committed_len', None) or len(req.prefix_indices)
+                    req.fill_ids = req.fill_ids[:prefix_len + req.extend_input_len]
 
-            input_ids_list.extend(req.fill_ids[prefix_len:])
-            sl = len(req.fill_ids)
+            if not _pure_decode:
+                input_ids_list.extend(req.fill_ids[prefix_len:])
+            sl = prefix_len + extend_lens[i]
             seq_lens[i] = sl
             prefix_lens[i] = prefix_len
             rpx_list[i] = req.req_pool_idx
 
-        # 4. Rebuild batch tensors
+        # 4. Rebuild batch tensors (reuse pre-allocated buffers when possible)
         self.forward_mode = ForwardMode.DLLM_EXTEND
-        self.req_pool_indices = torch.tensor(
-            rpx_list, dtype=torch.int64, device=self.device,
-        )
-        self.input_ids = torch.tensor(
-            input_ids_list, dtype=torch.int64, device=self.device
-        )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+
+        # Reuse req_pool_indices (doesn't change between decode steps with same batch)
+        _rpx_cache = getattr(self, '_dllm_rpx_cache', None)
+        if _pure_decode and _rpx_cache is not None and _rpx_cache[0] == rpx_list:
+            self.req_pool_indices = _rpx_cache[1]
+        else:
+            self.req_pool_indices = torch.tensor(
+                rpx_list, dtype=torch.int64, device=self.device,
+            )
+            if _pure_decode:
+                self._dllm_rpx_cache = (rpx_list[:], self.req_pool_indices)
+
+        # Optimization: for pure-decode batches, reuse pre-filled MASK template.
+        # The algorithm's classify phase overwrites non-mask positions in-place.
+        _buf = getattr(self, '_dllm_input_ids_buf', None)
+        if _pure_decode and _buf is not None and _buf.shape[0] == num_tokens:
+            # Fast path: fill with mask_id, skip CPU→GPU transfer
+            _buf.fill_(self.dllm_config.mask_id)
+            self.input_ids = _buf
+        elif _pure_decode:
+            # First pure-decode step: create and cache the buffer
+            self.input_ids = torch.full(
+                (num_tokens,), self.dllm_config.mask_id,
+                dtype=torch.int64, device=self.device
+            )
+            self._dllm_input_ids_buf = self.input_ids
+        else:
+            self.input_ids = torch.tensor(
+                input_ids_list, dtype=torch.int64, device=self.device
+            )
+
+        # Build seq_lens tensors
+        _sl_t = torch.tensor(seq_lens, dtype=torch.int64)
+        _sl_gpu = getattr(self, '_dllm_seq_lens_gpu', None)
+        if _pure_decode and _sl_gpu is not None and _sl_gpu.shape[0] == bs:
+            _sl_gpu.copy_(_sl_t)
+            self.seq_lens = _sl_gpu
+        else:
+            self.seq_lens = _sl_t.to(self.device)
+            if _pure_decode:
+                self._dllm_seq_lens_gpu = self.seq_lens
+        self.seq_lens_cpu = _sl_t
+        self.orig_seq_lens = self.seq_lens.to(dtype=torch.int32)
         self.seq_lens_sum = sum(seq_lens)
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens

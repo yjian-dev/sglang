@@ -413,9 +413,18 @@ class TpModelWorker(BaseTpWorker):
     def _forward_batch_generation_dllm(
         self, forward_batch: ForwardBatch, overlap_fn=None,
     ) -> GenerationBatchResult:
+        import time as _time
+        _t0 = _time.perf_counter()
         logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
             self.model_runner, forward_batch, overlap_fn=overlap_fn,
         )
+        _t1 = _time.perf_counter()
+        # Track algorithm.run time for profiling
+        _algo_times = getattr(self, '_dllm_algo_times', None)
+        if _algo_times is None:
+            _algo_times = []
+            self._dllm_algo_times = _algo_times
+        _algo_times.append(_t1 - _t0)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
@@ -450,9 +459,28 @@ class TpModelWorker(BaseTpWorker):
             assert forward_batch is not None
 
         if self.is_dllm():
-            return self._forward_batch_generation_dllm(
+            import time as _time
+            _tinit = _time.perf_counter()
+            result = self._forward_batch_generation_dllm(
                 forward_batch, overlap_fn=getattr(model_worker_batch, '_dllm_overlap_fn', None)
             )
+            _tdone = _time.perf_counter()
+            # Track init_new + algorithm timing
+            _fwd_times = getattr(self, '_dllm_fwd_profile', None)
+            if _fwd_times is None:
+                _fwd_times = {'init_new': [], 'algo': [], 'count': 0}
+                self._dllm_fwd_profile = _fwd_times
+            algo_time = self._dllm_algo_times[-1] if self._dllm_algo_times else 0
+            init_time = (_tdone - _tinit) - algo_time
+            _fwd_times['init_new'].append(init_time)
+            _fwd_times['algo'].append(algo_time)
+            _fwd_times['count'] += 1
+            if _fwd_times['count'] % 500 == 0:
+                n = min(500, len(_fwd_times['init_new']))
+                avg_init = sum(_fwd_times['init_new'][-n:]) / n * 1e6
+                avg_algo = sum(_fwd_times['algo'][-n:]) / n * 1e6
+                logger.info(f"[DLLM fwd profile] init_new={avg_init:.0f}us algo={avg_algo:.0f}us")
+            return result
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(

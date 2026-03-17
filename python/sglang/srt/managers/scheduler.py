@@ -1188,6 +1188,14 @@ class Scheduler(
         _recv_done = False  # True when recv was done during overlap window
         _overlap_recv_reqs = []  # Buffered recv results from overlap
 
+        # Detailed per-phase timing (collected every N steps, logged periodically)
+        _phase_times = {
+            'recv': [], 'filter': [], 'absorb': [],
+            'prep': [], 'get_batch': [], 'forward_call': [],
+            'process': [], 'staging': [], 'total': [],
+        }
+        _PROFILE_INTERVAL = 500  # Log every N steps
+
         try:
             while True:
                 _t0 = time.perf_counter()
@@ -1223,10 +1231,6 @@ class Scheduler(
                 if self.waiting_queue:
                     self._inline_absorb_new_requests(batch)
                     _n_absorb += 1
-                    # Don't exit when batch is full — keep decoding until
-                    # requests finish, then absorb. Exiting causes the outer
-                    # scheduler to re-prefill all requests from scratch
-                    # (ChunkCache has no prefix matching).
                 _tc = time.perf_counter()
                 _t_absorb += (_tc - _tb)
                 _t1 = _tc
@@ -1244,7 +1248,14 @@ class Scheduler(
                 self.cur_batch = batch
                 self.forward_ct += 1
                 self._profile_batch_predicate(batch)
+                _t2a = time.perf_counter()
                 model_worker_batch = batch.get_model_worker_batch()
+                _t2b = time.perf_counter()
+
+                def _overlap_fn():
+                    nonlocal _recv_done, _overlap_recv_reqs
+                    _overlap_recv_reqs = self.recv_requests()
+                    _recv_done = True
 
                 def _overlap_fn():
                     nonlocal _recv_done, _overlap_recv_reqs
@@ -1267,7 +1278,31 @@ class Scheduler(
                 self.dllm_manager.staging_queue = [
                     r for r in batch.reqs if not r.finished()
                 ]
+                _t5 = time.perf_counter()
                 self.last_batch = batch
+
+                # Collect per-phase times
+                _phase_times['recv'].append(_ta - _t0)
+                _phase_times['filter'].append(_tb - _ta)
+                _phase_times['absorb'].append(_tc - _tb)
+                _phase_times['prep'].append(_t2 - _t1)
+                _phase_times['get_batch'].append(_t2b - _t2a)
+                _phase_times['forward_call'].append(_t3 - _t2b)
+                _phase_times['process'].append(_t4 - _t3)
+                _phase_times['staging'].append(_t5 - _t4)
+                _phase_times['total'].append(_t5 - _t0)
+
+                if len(_phase_times['total']) % _PROFILE_INTERVAL == 0:
+                    n = len(_phase_times['total'])
+                    parts = []
+                    for k in ['recv', 'filter', 'absorb', 'prep', 'get_batch', 'forward_call', 'process', 'staging']:
+                        avg_us = sum(_phase_times[k][-_PROFILE_INTERVAL:]) / _PROFILE_INTERVAL * 1e6
+                        parts.append(f"{k}={avg_us:.0f}")
+                    avg_total = sum(_phase_times['total'][-_PROFILE_INTERVAL:]) / _PROFILE_INTERVAL * 1e6
+                    logger.info(
+                        f"[DLLM step profile] step={avg_total:.0f}us bs={len(batch.reqs)} "
+                        + " ".join(parts)
+                    )
                 steps += 1
         except Exception as e:
             exit_reason = f"exception: {e}"
