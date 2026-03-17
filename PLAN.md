@@ -128,3 +128,7 @@ Could not parse evaluator response.
 
 ## Evaluator Feedback (Iteration 25)
 Could not parse evaluator response.
+
+
+## Evaluator Feedback (Iteration 26)
+1. Actually run all 8 configs through the benchmark pipeline - the plan shows zero checkboxes completed. 2. For each config, ensure throughput data for both AIME and ShareGPT at all 8 concurrency levels is recorded. 3. For each config, ensure quality data for all 5 benchmarks (GSM8K, HumanEval, IFEval, MBPP, MATH-500) is recorded. 4. For sampling configs (N=3/4/5 sampling), also record temp=0.6 quality results. 5. The results file appears to exist but likely contains only a template or partial data - populate it fully.
