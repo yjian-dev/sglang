@@ -1244,7 +1244,7 @@ class Scheduler(
                 _t2 = time.perf_counter()
                 _t_prep += (_t2 - _t1)
 
-                # Forward with overlap: recv_requests runs while GPU computes
+                # Forward with overlap: process(N-1) + prep(N+1) during GPU compute
                 self.cur_batch = batch
                 self.forward_ct += 1
                 self._profile_batch_predicate(batch)
