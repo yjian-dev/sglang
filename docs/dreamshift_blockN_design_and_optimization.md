@@ -335,10 +335,45 @@ DLLM uses extend mode because block_size tokens need causal attention. The metad
 
 Our inlined fast path saves ~100us of Python overhead by skipping the `update_single_wrapper` -> `call_begin_forward` call chain.
 
-## 7. Remaining Bottlenecks and Future Work
+## 7. Additional Optimizations Implemented
+
+### 7.1 Deferred `stream_output` (scheduler.py)
+
+**Problem**: `process_batch_result_dllm` runs serially after GPU forward, including `stream_output` (~120us) on the critical path between GPU steps.
+
+**Solution**: Split process into critical path and deferred work. After GPU forward, only run the critical path (KV free + state update + `free_group_end` + finished check). Push `stream_output` into the next step's `overlap_fn`, where it runs hidden behind GPU compute.
+
+```python
+# In _dllm_decode_loop overlap_fn:
+if _deferred_stream_batch is not None:
+    _reqs, _return_logprob = _deferred_stream_batch
+    self.stream_output(_reqs, _return_logprob)   # hidden during GPU compute
+    _deferred_stream_batch = None
+
+# After GPU forward:
+self._process_dllm_critical_inline(batch, result)  # KV free + state only
+_deferred_stream_batch = (list(batch.reqs), batch.return_logprob)
+```
+
+**Impact**: process time: 374us → 123-140us. step time: ~9.2ms → ~9.0ms.
+
+### 7.2 KV Scatter Cache + Incremental `seq_lens_sum` (schedule_batch.py)
+
+**Problem**: `prepare_for_dllm_decode` rebuilds several tensors from scratch every step:
+- `rpx_indices = rpx_t.repeat_interleave(block_size)` — constant when batch is stable
+- `pos_offsets = torch.arange(block_size).repeat(bs)` — pure constant
+- `seq_lens_sum = sum(seq_lens)` — always increases by `bs * block_size` per step
+
+**Solution**: Cache `(rpx_indices, pos_offsets)` keyed by `(bs, block_size, tuple(rpx_list))`. Compute `seq_lens_sum` incrementally as `prev_sum + bs * block_size` when batch is stable.
+
+**Impact**: prep time: 220us → 180us (~20% reduction).
+
+**Combined effect of 7.1 + 7.2**: TP=1, N=3, bf16, C=1: 290 → 304 tok/s (+5%).
+
+## 8. Remaining Bottlenecks and Future Work
 
 ### Short-term (< 1 week)
-1. **Inline flashinfer metadata further**: Pre-compute `qo_indptr` (constant for uniform block_size), cache `kv_indptr` pattern
+1. **Inline flashinfer metadata further (partially attempted)**: Pre-compute `qo_indptr` (constant for uniform block_size), cache `kv_indptr` pattern
 2. **CUDA stream overlap for verify+sample**: Launch verify/sample kernels on a separate stream concurrent with next step's metadata update
 3. **Reduce `trim_assemble` Python overhead**: Pre-allocate output lists, vectorize KV trim index computation
 
