@@ -1054,6 +1054,64 @@ class CudaGraphRunner:
         buffers.input_ids[:self.raw_num_token].copy_(forward_batch.input_ids[:self.raw_num_token])
         self._early_prepared = False
 
+    def init_dllm_metadata_early(self, forward_batch: ForwardBatch) -> bool:
+        """DLLM optimization: init flashinfer metadata BEFORE classify phase.
+
+        Called by the DLLM algorithm before filling input_ids, so the async
+        GPU plan (flashinfer begin_forward, non_blocking=True) can run during
+        the CPU-side classify loop (~190us overlap).
+
+        Returns True if early init succeeded and replay_prepare should skip
+        the metadata step.
+        """
+        if not forward_batch.forward_mode.is_dllm_extend():
+            return False
+        try:
+            raw_bs = forward_batch.batch_size
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+            bs = self.capture_bs[index]
+            attn_backend = self.model_runner.attn_backend
+            seq_lens_sum_padded = (
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+            )
+            # Need padded tensors matching the capture bs
+            buffers = self.buffers
+            # Copy real seq_lens to buffers first (replicate what populate does for these fields)
+            buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            if raw_bs < bs:
+                buffers.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+            buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            if raw_bs < bs:
+                buffers.req_pool_indices[raw_bs:bs].fill_(0)
+            # seq_lens_cpu: just extend with fill value
+            if forward_batch.seq_lens_cpu is not None:
+                sl_cpu = forward_batch.seq_lens_cpu
+                if raw_bs < bs:
+                    import torch as _torch
+                    pad = _torch.full((bs - raw_bs,), self.seq_len_fill_value, dtype=sl_cpu.dtype)
+                    sl_cpu_padded = _torch.cat([sl_cpu, pad])
+                else:
+                    sl_cpu_padded = sl_cpu
+            else:
+                sl_cpu_padded = None
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                seq_lens_sum_padded,
+                None,  # encoder_lens not used by DLLM
+                self.capture_forward_mode,
+                None,  # spec_info not used by DLLM
+                seq_lens_cpu=sl_cpu_padded[:bs] if sl_cpu_padded is not None else None,
+            )
+            self._dllm_metadata_pre_initialized = True
+            self._dllm_early_bs = bs
+            self._dllm_early_raw_bs = raw_bs
+            return True
+        except Exception:
+            self._dllm_metadata_pre_initialized = False
+            return False
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -1104,21 +1162,25 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.model_runner.attn_backend
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
+        # Skip if DLLM pre-initialized metadata early (before classify) for overlap
+        _skip_metadata = getattr(self, '_dllm_metadata_pre_initialized', False)
+        self._dllm_metadata_pre_initialized = False  # consume the flag
+        if not _skip_metadata:
+            if self.enable_pdmux:
+                stream_idx = get_current_stream_idx()
+                attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+            else:
+                attn_backend = self.model_runner.attn_backend
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            )
 
         # Store fields
         self.raw_bs = raw_bs
