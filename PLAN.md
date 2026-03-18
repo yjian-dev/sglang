@@ -100,3 +100,7 @@ HF_TOKEN=<your_hf_token>  # for gated datasets like GPQA
 - 2026-03-18: LCB-v6 45.1% confirmed with OC evaluator (reliability_guard fix)
 - 2026-03-18: eval scripts pushed to jyq/dreamshift-blockN-accuracy-fix
 - Started Phase 1 (missing benchmarks)
+
+
+## Evaluator Feedback (Iteration 1)
+Could not parse evaluator response.
