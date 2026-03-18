@@ -2140,7 +2140,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self._dllm_seq_lens_gpu = self.seq_lens
         self.seq_lens_cpu = _sl_t
         self.orig_seq_lens = self.seq_lens.to(dtype=torch.int32)
-        self.seq_lens_sum = sum(seq_lens)
+        # Incremental seq_lens_sum: pure decode adds exactly bs*block_size each step
+        _prev_sum = getattr(self, '_dllm_seq_lens_sum_cache', None)
+        if _pure_decode and _prev_sum is not None and _prev_sum[0] == bs:
+            self.seq_lens_sum = _prev_sum[1] + bs * block_size
+        else:
+            self.seq_lens_sum = sum(seq_lens)
+        self._dllm_seq_lens_sum_cache = (bs, self.seq_lens_sum)
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.extend_num_tokens = num_tokens
@@ -2151,11 +2157,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Vectorized for pure-decode batches (all extend_lens == block_size)
         if all(el == block_size for el in extend_lens):
             # Fast path: uniform extend lengths — use vectorized torch ops
-            rpx_t = torch.tensor(rpx_list, dtype=torch.long)
+            # Cache pos_offsets (constant for fixed bs/block_size) and rpx_indices (stable batch)
+            _scatter_cache = getattr(self, '_dllm_scatter_cache', None)
+            _cache_key = (bs, block_size, tuple(rpx_list))
+            if _scatter_cache is not None and _scatter_cache[0] == _cache_key:
+                rpx_indices, pos_offsets = _scatter_cache[1], _scatter_cache[2]
+            else:
+                rpx_t = torch.tensor(rpx_list, dtype=torch.long)
+                rpx_indices = rpx_t.repeat_interleave(block_size)
+                pos_offsets = torch.arange(block_size).repeat(bs)
+                self._dllm_scatter_cache = (_cache_key, rpx_indices, pos_offsets)
             pl_t = torch.tensor(prefix_lens, dtype=torch.long)
-            rpx_indices = rpx_t.repeat_interleave(block_size)
             pos_base = pl_t.repeat_interleave(block_size)
-            pos_offsets = torch.arange(block_size).repeat(bs)
             pos_indices = pos_base + pos_offsets
             self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
                 self.req_to_token_pool.req_to_token.dtype
