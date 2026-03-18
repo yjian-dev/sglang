@@ -622,18 +622,28 @@ class DreamShiftBlockN(DllmAlgorithm):
                 ]
 
                 if self.temperature > 0:
-                    # Sample all positions, then overwrite specs with argmax for better accept rate
-                    all_sample_ids_gpu, _ = _batched_sample(
-                        all_sample_logits, self.temperature, self.top_k, self.top_p
-                    )
-                    # Overwrite spec positions with argmax (they're guesses for next verify)
+                    # Split: sample only CLEAN positions (expensive top_k/top_p),
+                    # argmax SPEC positions directly (cheap, they're just guesses)
+                    clean_indices = list(range(0, len(sample_logit_indices), gs))
                     draft_indices = []
                     for group_start in range(0, len(sample_logit_indices), gs):
                         for m in range(num_masks):
                             draft_indices.append(group_start + 1 + m)
+
+                    # Sample clean positions only (1 per request instead of gs)
+                    clean_logits = all_sample_logits[clean_indices]
+                    clean_ids, _ = _batched_sample(
+                        clean_logits, self.temperature, self.top_k, self.top_p
+                    )
+
+                    # Argmax + softmax for draft positions (skip expensive sampling)
+                    all_sample_ids_gpu = torch.empty(
+                        len(sample_logit_indices), dtype=clean_ids.dtype, device=device
+                    )
+                    all_sample_ids_gpu[clean_indices] = clean_ids
                     if draft_indices:
                         draft_logits = all_sample_logits[draft_indices]
-                        all_sample_ids_gpu[draft_indices] = draft_logits.argmax(dim=-1).to(all_sample_ids_gpu.dtype)
+                        all_sample_ids_gpu[draft_indices] = draft_logits.argmax(dim=-1).to(clean_ids.dtype)
                         scaled_draft = draft_logits if self.temperature == 1.0 else draft_logits / self.temperature
                         draft_probs_all = F.softmax(scaled_draft, dim=-1)
                 else:

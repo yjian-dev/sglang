@@ -1167,6 +1167,95 @@ class Scheduler(
                 r for r in batch.reqs if not r.finished()
             ]
 
+    def _process_dllm_critical_inline(self, batch, result):
+        """Critical-path DLLM processing: KV free + state update + finished check.
+
+        Defers stream_output to the next step's overlap window to reduce
+        the serial CPU gap between GPU forward calls (NanoFlow-style async).
+        """
+        import torch
+
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        dllm_algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        kv_trim_info = getattr(dllm_algo, "_kv_trim_info", {}) if dllm_algo else {}
+        advance_override = getattr(dllm_algo, "_advance_override", {}) if dllm_algo else {}
+        dllm_write_override = getattr(dllm_algo, "_dllm_write_override", {}) if dllm_algo else {}
+
+        # Batch KV free
+        kv_gpu_parts = []
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            trim_info = kv_trim_info.get(batch.reqs[idx].req_pool_idx)
+            if trim_info is not None:
+                gpu_indices = trim_info.get("kv_indices_gpu")
+                if gpu_indices is not None:
+                    kv_gpu_parts.append(gpu_indices)
+        if kv_gpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+
+        # State updates + output_ids + finished check
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            req = batch.reqs[idx]
+            req_pool_idx = req.req_pool_idx
+            raw = result.next_token_ids[idx]
+            next_token_ids = raw if isinstance(raw, list) else raw.tolist()
+
+            is_inline_pf = getattr(req, '_inline_prefill', False)
+            if not next_token_ids or is_inline_pf:
+                if not getattr(batch, '_dllm_decode_mode', False) or is_inline_pf:
+                    self.tree_cache.cache_unfinished_req(req)
+                if req.is_dllm() and (req.is_dllm_prefill() or is_inline_pf):
+                    origin_len = len(req.origin_input_ids)
+                    cached_len = len(req.prefix_indices) if req.prefix_indices is not None else 0
+                    if cached_len >= origin_len:
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        req.dllm_next_advance = origin_len
+                        req._inline_prefill = False
+                continue
+
+            self.num_generated_tokens += len(next_token_ids)
+
+            # KV state
+            trim_info = kv_trim_info.get(req_pool_idx)
+            if trim_info is not None:
+                trim_count = trim_info["trim_count"]
+                req.kv_committed_len -= trim_count
+                req.kv_allocated_len -= trim_count
+                req.dllm_kv_valid_len = req.kv_committed_len
+            else:
+                req.dllm_kv_valid_len = None
+
+            adv = advance_override.get(req_pool_idx)
+            if adv is not None:
+                req.dllm_next_advance = adv
+
+            # dllm_ids write
+            dllm_tokens = dllm_write_override.pop(req_pool_idx, None)
+            if req.dllm_ids and dllm_tokens is not None:
+                write_start = req.dllm_block_offset
+                req.dllm_ids[write_start:write_start + len(dllm_tokens)] = dllm_tokens
+
+            # output_ids + finished check
+            for next_token_id in next_token_ids:
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+                if req.finished():
+                    from sglang.srt.managers.scheduler_output_processor_mixin import release_kv_cache
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    if dllm_algo is not None:
+                        dllm_algo.cleanup_request(req_pool_idx)
+                    break
+
+        self.token_to_kv_pool_allocator.free_group_end()
+
     def _dllm_decode_loop(self, initial_batch):
         """DLLM decode-mode inner loop: reuse batch with prepare_for_dllm_decode.
 
@@ -1187,6 +1276,7 @@ class Scheduler(
         _n_absorb = 0
         _recv_done = False  # True when recv was done during overlap window
         _overlap_recv_reqs = []  # Buffered recv results from overlap
+        _deferred_stream_batch = None  # Deferred stream_output from previous step
 
         # Detailed per-phase timing (collected every N steps, logged periodically)
         _phase_times = {
@@ -1253,7 +1343,12 @@ class Scheduler(
                 _t2b = time.perf_counter()
 
                 def _overlap_fn():
-                    nonlocal _recv_done, _overlap_recv_reqs
+                    nonlocal _recv_done, _overlap_recv_reqs, _deferred_stream_batch
+                    # Deferred stream_output from previous step (hidden behind GPU compute)
+                    if _deferred_stream_batch is not None:
+                        _reqs, _return_logprob = _deferred_stream_batch
+                        self.stream_output(_reqs, _return_logprob)
+                        _deferred_stream_batch = None
                     _overlap_recv_reqs = self.recv_requests()
                     _recv_done = True
 
@@ -1266,7 +1361,12 @@ class Scheduler(
 
                 _t3 = time.perf_counter()
                 _t_forward += (_t3 - _t2)
-                self.process_batch_result(batch, result)
+
+                # Critical-path process: KV free + state update + finished check
+                # (stream_output is deferred to next step's overlap window)
+                self._process_dllm_critical_inline(batch, result)
+                # Snapshot reqs+flag for deferred stream (batch is mutated by filter_batch)
+                _deferred_stream_batch = (list(batch.reqs), batch.return_logprob)
                 _t4 = time.perf_counter()
                 _t_process += (_t4 - _t3)
 
@@ -1304,6 +1404,12 @@ class Scheduler(
             logger.error(f"[DLLM decode loop] exception after {steps} steps: {e}")
             import traceback
             traceback.print_exc()
+
+        # Flush deferred stream_output before exiting
+        if _deferred_stream_batch is not None:
+            _reqs, _return_logprob = _deferred_stream_batch
+            self.stream_output(_reqs, _return_logprob)
+            _deferred_stream_batch = None
 
         batch._dllm_decode_mode = False
 
