@@ -1,22 +1,25 @@
 """
-MMLU-Pro evaluation across multiple sglang servers.
+CMMLU (Chinese MMLU) evaluation across multiple sglang servers.
 
-MMLU-Pro has 10 choices (A-J) instead of 4, covering 14 disciplines.
-Uses TIGER-Lab/MMLU-Pro from HuggingFace.
+Loads from haonan-li/cmmlu zip file (dataset scripts unsupported in new HF).
 
 Usage:
-  python scripts/eval_mmlu_pro.py                          # 1000 problems, 8 GPUs
-  python scripts/eval_mmlu_pro.py --num-problems 500
+  python scripts/eval_cmmlu.py                          # 2000 random problems, 8 GPUs
+  python scripts/eval_cmmlu.py --num-problems 500       # quick
 """
 import argparse
+import csv
 import json
 import os
+import random
 import re
+import tempfile
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 
 
 def strip_thinking(text):
@@ -26,38 +29,61 @@ def strip_thinking(text):
 
 
 def extract_choice(text):
-    """Extract single letter choice (A-J) from model output."""
+    """Extract single letter choice (A-D) from model output."""
     text = strip_thinking(text)
-    # Look for "answer is (X)" or "answer is X"
-    m = re.search(r"[Aa]nswer is:?\s*\(?([A-Ja-j])\)?", text)
+    m = re.search(r"[Aa]nswer is:?\s*\(?([A-Da-d])\)?", text)
     if m:
         return m.group(1).upper()
-    # Look for boxed answer
-    m = re.search(r"\\boxed\{([A-Ja-j])\}", text)
+    m = re.search(r"答案[是为：:]\s*\(?([A-Da-d])\)?", text)
     if m:
         return m.group(1).upper()
-    # Last standalone letter
-    m = re.findall(r'\b([A-Ja-j])\b', text)
+    m = re.search(r"选\s*\(?([A-Da-d])\)?", text)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"\\boxed\{([A-Da-d])\}", text)
+    if m:
+        return m.group(1).upper()
+    m = re.findall(r'\b([A-Da-d])\b', text)
     if m:
         return m[-1].upper()
     return "?"
 
 
-def format_choices(options):
-    """Format choices as A. xxx  B. xxx  ..."""
-    letters = "ABCDEFGHIJ"
-    lines = []
-    for i, opt in enumerate(options):
-        if i < len(letters):
-            lines.append(f"{letters[i]}. {opt}")
-    return "\n".join(lines)
+def load_cmmlu():
+    """Load CMMLU from zip file."""
+    path = hf_hub_download("haonan-li/cmmlu", "cmmlu_v1_0_1.zip", repo_type="dataset")
+    tmpdir = tempfile.mkdtemp()
+    items = []
+    LETTERS = "ABCD"
+    with zipfile.ZipFile(path) as z:
+        for name in z.namelist():
+            if name.startswith("test/") and name.endswith(".csv"):
+                z.extract(name, tmpdir)
+                filepath = os.path.join(tmpdir, name)
+                subject = os.path.basename(name).replace(".csv", "")
+                with open(filepath, encoding="utf-8") as f:
+                    reader = csv.reader(f)
+                    header = next(reader)  # skip header
+                    for row in reader:
+                        if len(row) >= 6:
+                            # Format: idx, Question, A, B, C, D, Answer
+                            q = row[1]
+                            choices = [row[2], row[3], row[4], row[5]]
+                            gold = row[6].strip() if len(row) > 6 else "?"
+                            items.append({
+                                "question": q,
+                                "choices": choices,
+                                "answer": gold,
+                                "subject": subject,
+                            })
+    return items
 
 
 def run_one(args):
     idx, question, choices_str, gold, port, max_tokens, timeout, temperature, top_p, top_k = args
     prompt = (
         f"{question}\n\n{choices_str}\n\n"
-        "Think step by step, then give your answer as \"The answer is (X)\"."
+        "请逐步思考，然后给出你的答案，格式为\"答案是(X)\"。"
     )
     try:
         r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={
@@ -79,9 +105,9 @@ def run_one(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-problems", type=int, default=0, help="0 = all")
+    parser.add_argument("--num-problems", type=int, default=2000)
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
@@ -90,28 +116,24 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    if args.num_problems > 0 and args.num_problems < len(ds):
-        import random
-        random.seed(42)
-        indices = random.sample(range(len(ds)), args.num_problems)
-        subset = ds.select(indices)
-    else:
-        subset = ds
-    N = len(subset)
+    print("Loading CMMLU dataset from zip...")
+    all_items = load_cmmlu()
+    print(f"Total CMMLU test problems: {len(all_items)}")
+
+    random.seed(42)
+    N = min(args.num_problems, len(all_items))
+    sampled = random.sample(all_items, N)
     ports = args.ports
 
-    LETTERS = "ABCDEFGHIJ"
+    LETTERS = "ABCD"
     problems = []
-    for item in subset:
+    for item in sampled:
         q = item["question"]
-        options = item["options"]
-        choices_str = format_choices(options)
-        gold_idx = item["answer_index"]
-        gold = LETTERS[gold_idx] if isinstance(gold_idx, int) else str(item["answer"])
+        choices_str = "\n".join(f"{LETTERS[i]}. {item['choices'][i]}" for i in range(4))
+        gold = item["answer"]
         problems.append((q, choices_str, gold))
 
-    print(f"MMLU-Pro eval: {N} problems, {len(ports)} servers")
+    print(f"CMMLU eval: {N} problems, {len(ports)} servers")
 
     tasks = [
         (i, q, c, g, ports[i % len(ports)], args.max_tokens, args.timeout,
@@ -154,7 +176,7 @@ def main():
 
     acc = correct / N * 100
     print(f"\n{'=' * 60}")
-    print(f"MMLU-Pro {N} problems, {len(ports)} GPUs")
+    print(f"CMMLU {N} problems, {len(ports)} GPUs")
     print(f"{'=' * 60}")
     print(f"Accuracy:       {correct}/{N} ({acc:.1f}%)")
     print(f"Truncated:      {truncated}")
@@ -174,9 +196,10 @@ def main():
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "mmlu_pro_summary.json"), "w") as f:
+        with open(os.path.join(args.output_dir, "cmmlu_summary.json"), "w") as f:
             json.dump({"accuracy": acc, "correct": correct, "total": N,
-                       "tokens": total_tok}, f, indent=2)
+                       "tokens": total_tok, "truncated": truncated,
+                       "no_extract": no_extract, "wrong": wrong}, f, indent=2)
 
 
 if __name__ == "__main__":

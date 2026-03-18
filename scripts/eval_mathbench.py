@@ -1,16 +1,16 @@
 """
-MMLU-Pro evaluation across multiple sglang servers.
+MathBench evaluation across multiple sglang servers.
 
-MMLU-Pro has 10 choices (A-J) instead of 4, covering 14 disciplines.
-Uses TIGER-Lab/MMLU-Pro from HuggingFace.
+Uses MENTOR-RL/math-bench dataset (4077 problems, numeric/short answers).
 
 Usage:
-  python scripts/eval_mmlu_pro.py                          # 1000 problems, 8 GPUs
-  python scripts/eval_mmlu_pro.py --num-problems 500
+  python scripts/eval_mathbench.py                          # 1000 random problems, 8 GPUs
+  python scripts/eval_mathbench.py --num-problems 500       # quick
 """
 import argparse
 import json
 import os
+import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,39 +25,44 @@ def strip_thinking(text):
     return re.sub(r"^.*?</think>\s*", "", text, count=1, flags=re.DOTALL)
 
 
-def extract_choice(text):
-    """Extract single letter choice (A-J) from model output."""
+def extract_answer(text):
+    """Extract numeric/short answer from model output."""
     text = strip_thinking(text)
-    # Look for "answer is (X)" or "answer is X"
-    m = re.search(r"[Aa]nswer is:?\s*\(?([A-Ja-j])\)?", text)
+    # boxed answer
+    m = re.search(r"\\boxed\{([^}]+)\}", text)
     if m:
-        return m.group(1).upper()
-    # Look for boxed answer
-    m = re.search(r"\\boxed\{([A-Ja-j])\}", text)
+        return m.group(1).strip()
+    # "answer is X"
+    m = re.search(r"[Aa]nswer is:?\s*(.+?)(?:\.|,|\n|$)", text)
     if m:
-        return m.group(1).upper()
-    # Last standalone letter
-    m = re.findall(r'\b([A-Ja-j])\b', text)
-    if m:
-        return m[-1].upper()
+        ans = m.group(1).strip()
+        if ans:
+            return ans
+    # Last line
+    lines = text.strip().split('\n')
+    if lines:
+        return lines[-1].strip()
     return "?"
 
 
-def format_choices(options):
-    """Format choices as A. xxx  B. xxx  ..."""
-    letters = "ABCDEFGHIJ"
-    lines = []
-    for i, opt in enumerate(options):
-        if i < len(letters):
-            lines.append(f"{letters[i]}. {opt}")
-    return "\n".join(lines)
+def normalize_answer(s):
+    """Normalize numeric answer for comparison."""
+    s = s.strip().rstrip(".")
+    # Remove $ signs, commas
+    s = s.replace("$", "").replace(",", "").replace(" ", "")
+    # Try to convert to float for numeric comparison
+    try:
+        return str(float(s))
+    except ValueError:
+        return s.lower()
 
 
 def run_one(args):
-    idx, question, choices_str, gold, port, max_tokens, timeout, temperature, top_p, top_k = args
+    idx, question, gold, port, max_tokens, timeout, temperature, top_p, top_k = args
     prompt = (
-        f"{question}\n\n{choices_str}\n\n"
-        "Think step by step, then give your answer as \"The answer is (X)\"."
+        f"{question}\n\n"
+        "Think step by step, then give your final answer. "
+        "Put your answer in \\boxed{} format."
     )
     try:
         r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={
@@ -71,7 +76,7 @@ def run_one(args):
         content = r["choices"][0]["message"]["content"]
         finish = r["choices"][0].get("finish_reason", "")
         comp = r["usage"]["completion_tokens"]
-        pred = extract_choice(content)
+        pred = extract_answer(content)
         return idx, pred, gold, comp, finish, content, None
     except Exception as e:
         return idx, "?", gold, 0, "", "", str(e)
@@ -79,44 +84,39 @@ def run_one(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-problems", type=int, default=0, help="0 = all")
+    parser.add_argument("--num-problems", type=int, default=1000)
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--max-workers", type=int, default=512)
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    if args.num_problems > 0 and args.num_problems < len(ds):
-        import random
-        random.seed(42)
-        indices = random.sample(range(len(ds)), args.num_problems)
-        subset = ds.select(indices)
-    else:
-        subset = ds
-    N = len(subset)
+    print("Loading MathBench dataset...")
+    ds = load_dataset("MENTOR-RL/math-bench", split="train")
+    print(f"Total MathBench problems: {len(ds)}")
+
+    random.seed(42)
+    N = min(args.num_problems, len(ds))
+    indices = random.sample(range(len(ds)), N)
+    subset = ds.select(indices)
     ports = args.ports
 
-    LETTERS = "ABCDEFGHIJ"
     problems = []
     for item in subset:
         q = item["question"]
-        options = item["options"]
-        choices_str = format_choices(options)
-        gold_idx = item["answer_index"]
-        gold = LETTERS[gold_idx] if isinstance(gold_idx, int) else str(item["answer"])
-        problems.append((q, choices_str, gold))
+        gold = str(item["answer"]).strip()
+        problems.append((q, gold))
 
-    print(f"MMLU-Pro eval: {N} problems, {len(ports)} servers")
+    print(f"MathBench eval: {N} problems, {len(ports)} servers")
 
     tasks = [
-        (i, q, c, g, ports[i % len(ports)], args.max_tokens, args.timeout,
+        (i, q, g, ports[i % len(ports)], args.max_tokens, args.timeout,
          args.temperature, args.top_p, args.top_k)
-        for i, (q, c, g) in enumerate(problems)
+        for i, (q, g) in enumerate(problems)
     ]
 
     t0 = time.time()
@@ -137,7 +137,9 @@ def main():
             errors += 1
             continue
         total_tok += comp
-        if pred == gold:
+        pred_norm = normalize_answer(pred)
+        gold_norm = normalize_answer(gold)
+        if pred_norm == gold_norm:
             correct += 1
         else:
             if finish == "length":
@@ -154,7 +156,7 @@ def main():
 
     acc = correct / N * 100
     print(f"\n{'=' * 60}")
-    print(f"MMLU-Pro {N} problems, {len(ports)} GPUs")
+    print(f"MathBench {N} problems, {len(ports)} GPUs")
     print(f"{'=' * 60}")
     print(f"Accuracy:       {correct}/{N} ({acc:.1f}%)")
     print(f"Truncated:      {truncated}")
@@ -174,9 +176,10 @@ def main():
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "mmlu_pro_summary.json"), "w") as f:
+        with open(os.path.join(args.output_dir, "mathbench_summary.json"), "w") as f:
             json.dump({"accuracy": acc, "correct": correct, "total": N,
-                       "tokens": total_tok}, f, indent=2)
+                       "tokens": total_tok, "truncated": truncated,
+                       "no_extract": no_extract, "wrong": wrong}, f, indent=2)
 
 
 if __name__ == "__main__":
