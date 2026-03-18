@@ -2042,6 +2042,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # 3. Now safe to modify req state
         _pure_decode = all(el == block_size for el in extend_lens)
+        # PackInfer §3.1: sort by kv_committed_len so adjacent requests have similar
+        # KV lengths, reducing tile imbalance in flashinfer attention kernel.
+        if _pure_decode and bs > 1:
+            self.reqs.sort(key=lambda r: r.kv_committed_len)
         input_ids_list = [] if not _pure_decode else None  # Skip for pure decode
         seq_lens = [0] * bs
         prefix_lens = [0] * bs
