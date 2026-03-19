@@ -315,3 +315,7 @@ This project has been blocked for 18 iterations on the same two issues. Stop ite
 
 ## Evaluator Feedback (Iteration 19)
 This project has been blocked for 19 iterations. Stop iterating and require user intervention: (1) Ask the user to either provide HF_TOKEN to run GPQA and fill the 15th row, OR explicitly approve changing the success condition from 15 to 14 rows. (2) Either restart servers on ports 30000-30007 or update the test commands to target ports 30010-30017 where Qwen3-8B was last running. Without user action on these two items, no further progress is possible.
+
+
+## Evaluator Feedback (Iteration 20)
+This project requires user intervention to proceed. Stop iterating and escalate: (1) Ask the user to either provide HF_TOKEN to run GPQA (main + diamond) for both models and fill the 15th row, OR explicitly approve changing the success condition from '15 rows' to '14 rows'. (2) Restart servers on ports 30000-30007 (either DLLM or Qwen3-8B) so health checks pass and the sanity test returns >0% accuracy, OR update the test commands to target ports 30010-30017 where Qwen3-8B was previously running. (3) Fix the conda activation command to use POSIX-compatible '. /home/yjian/miniconda3/etc/profile.d/conda.sh' instead of 'source'. Do NOT schedule another iteration without resolving at least one of these blockers.
