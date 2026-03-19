@@ -1,105 +1,176 @@
-# Agent Prompt — Benchmark Evaluation (DLLM vs Qwen3-8B)
+# Agent Prompt — Full Benchmark Suite (DLLM N=3 vs Qwen3-8B)
 
 ## Role
-You are a benchmark evaluation agent. Your job is to run missing quality benchmarks on the DLLM model (N=3 sampling), analyze wrong answers, fix evaluation issues, and then run the same benchmarks on Qwen3-8B for comparison.
+You are a benchmark evaluation agent. Run all benchmarks for both models, check output quality after each benchmark, fix issues, and record results in PLAN.md.
 
-## Project Description
-We have a DLLM model (DreamShiftBlockN N=3 sampling) running on 8x TP=1 servers (ports 30000-30007). We need to complete the benchmark table in PLAN.md. For each benchmark:
-1. Run it on DLLM (ports 30000-30007)
-2. Check wrong answers — determine if failures are due to (a) extraction bug, (b) max_tokens truncation, or (c) actual model limitations
-3. Fix the script if (a) or (b), re-run
-4. Run same script on Qwen3-8B (launch fresh 8 servers on ports 30010-30017 using Qwen/Qwen3-8B)
-
-## Current Model (already running)
-- **Model**: `/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont`
-- **Algorithm**: DreamShiftBlockN N=3 sampling (block_size=5, gen_block_size=3)
-- **Config**: `dreamshift_blockN3_config.yaml`
-- **Servers**: 8x TP=1, ports 30000-30007, max-running-requests=32
-- **DO NOT KILL OR RESTART these servers unless they crash**
-
-## Benchmarks to Complete (in priority order)
-
-### 1. ARC-C (Quick, ~1.2k problems)
-- Dataset: `allenai/ai2_arc`, config `ARC-Challenge`, split `test`
-- Format: 4-choice (A/B/C/D), generate answer
-- Script: `scripts/eval_arc_c.py` (create if not exists)
-
-### 2. MMLU (57 subjects, ~14k problems — sample 2k randomly)
-- Dataset: `cais/mmlu`, config `all`, split `test`
-- Format: 4-choice, generate answer
-- Script: `scripts/eval_mmlu.py` (create if not exists)
-
-### 3. MMLU-Pro (already have script, fix sampling)
-- Dataset: `TIGER-Lab/MMLU-Pro`, split `test`
-- Issue: previous run used first 2k which was biased (all law). Fix: random sample.
-- Script: `scripts/eval_mmlu_pro.py` — fix to use random seed=42 sampling, run 2000 problems
-
-### 4. CMMLU (Chinese MMLU, ~11.5k problems — sample 2k)
-- Dataset: `haonan-li/cmmlu`, all subjects
-- Format: 4-choice Chinese multiple choice
-- Script: `scripts/eval_cmmlu.py` (create)
-
-### 5. MMMLU-lite (multilingual, sample from English + 5 key languages)
-- Dataset: `openai/MMMLU`, language configs: `EN_US`, `ZH_CN`, `JA_JP`, `FR_FR`, `DE_DE`, `KO_KR`
-- Sample ~200 per language
-- Script: `scripts/eval_mmmlu.py` (create)
-
-### 6. MathBench (math, ~3k — sample 1k)
-- Dataset: `opencompass/mathbench` or check HF for available dataset
-- Script: `scripts/eval_mathbench.py` (create)
-
-### 7. TriviaQA (already have script)
-- Script: `scripts/eval_triviaqa.py` — run with 1000 problems
-
-### 8. LongBench-v2 Hard (subset with difficulty='hard')
-- Dataset: `THUDM/LongBench-v2`, filter `difficulty == 'hard'`
-- Format: multiple choice or short answer
-- Script: `scripts/eval_longbench_hard.py` (create)
-- **Note**: requires long context (up to 128k), may need special handling
-
-## Qwen3-8B Comparison
-After completing DLLM benchmarks, launch Qwen3-8B:
-```bash
-source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
-export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
-export CUDA_HOME=/usr/local/cuda-12.9
-for gpu in 0 1 2 3 4 5 6 7; do
-  port=$((30010 + gpu))
-  CUDA_VISIBLE_DEVICES=$gpu nohup python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-8B --trust-remote-code --tp-size 1 \
-    --mem-fraction-static 0.85 --max-running-requests 64 \
-    --attention-backend flashinfer \
-    --dtype bfloat16 --port $port --chunked-prefill-size 4096 \
-    > /tmp/sglang_qwen_gpu${gpu}.log 2>&1 &
-done
-# Wait for all 8: check ports 30010-30017
-```
-Then run same scripts with `--ports 30010 30011 30012 30013 30014 30015 30016 30017`
-
-## Script Template
-All scripts should:
-- Use chat completions API (`/v1/chat/completions`)
-- Use `max_tokens=16384` (thinking models need long output)
-- Strip `<think>...</think>` before extracting answers
-- Distribute across all ports with `--ports 30000 30001 ... 30007`
-- Print wrong examples at the end to diagnose failures
-
-## Error Diagnosis Protocol
-After each benchmark run:
-1. Check if wrong answers are **truncated** (finish_reason='length') → increase max_tokens or reduce thinking
-2. Check if extraction **failed** (pred='?' or empty) → fix regex/extraction logic
-3. Check if model genuinely **wrong** → note as model limitation
+## Models
+- **DLLM N=3** (already running): ports 30000-30007, 8×TP=1
+- **Qwen3-8B**: launch on ports 30010-30017 when needed (see launch command below)
 
 ## Environment
 ```bash
 source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
 export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-12.9
+export HF_HOME=/data/yjian/hf_cache
+export HUGGINGFACE_HUB_CACHE=/data/yjian/hf_cache/hub
+export FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache
+export HF_TOKEN=<your_hf_token>
 ```
 
-## Constraints
-- Always use `--max-tokens 16384` or higher
-- If >10% of answers are truncated, increase to 32768
-- Record all results in PLAN.md results table
-- Fix scripts before considering a benchmark "done"
-- Skip LongBench-v2 if context length causes OOM
+## Launch Qwen3-8B (ports 30010-30017)
+```bash
+for i in $(seq 0 7); do
+  CUDA_VISIBLE_DEVICES=$i FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache nohup python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B --trust-remote-code --tp-size 1 \
+    --mem-fraction-static 0.85 --max-running-requests 64 \
+    --attention-backend flashinfer --dtype bfloat16 \
+    --port $((30010+i)) --chunked-prefill-size 4096 --watchdog-timeout 1800 \
+    > /tmp/sglang_qwen_gpu${i}.log 2>&1 &
+done
+# Wait for all 8: check ports 30010-30017
+for i in $(seq 0 7); do
+  for j in $(seq 1 60); do
+    curl -sf http://localhost:$((30010+i))/health > /dev/null 2>&1 && echo "GPU $i ready" && break
+    sleep 10
+  done
+done
+```
+
+## Benchmark Scripts
+All scripts are in `scripts/`. Default `--max-tokens 32768`. Use all 8 ports.
+
+```bash
+DLLM_PORTS="30000 30001 30002 30003 30004 30005 30006 30007"
+QWEN_PORTS="30010 30011 30012 30013 30014 30015 30016 30017"
+```
+
+## Benchmark List & Commands
+
+### 1. ARC-C (1172 problems, ~5 min)
+```bash
+python scripts/eval_arc_c.py --ports $PORTS
+```
+
+### 2. TriviaQA (1000 problems, ~3 min)
+**OC prompt**: "Answer these questions... start your answer with 'The answer is '"
+**Our prompt**: must match this pattern. Check `scripts/eval_triviaqa.py`.
+```bash
+python scripts/eval_triviaqa.py --num-problems 1000 --ports $PORTS
+```
+
+### 3. MMLU (random 2000 from 14k, ~10 min)
+```bash
+python scripts/eval_mmlu.py --num-problems 2000 --ports $PORTS
+```
+
+### 4. MMLU-Pro (random 2000 from 12k, ~15 min)
+```bash
+python scripts/eval_mmlu_pro.py --num-problems 2000 --ports $PORTS
+```
+
+### 5. GPQA-Diamond (198 problems, ~5 min)
+**OC prompt**: "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: $LETTER'... Think step by step before answering.\n\n{question}\n\nA) {A}\nB) {B}\nC) {C}\nD) {D}"
+**Note**: Uses `jianstreet` HF account (HF_TOKEN set above).
+```bash
+HF_TOKEN=<your_hf_token> python scripts/eval_gpqa.py --ports $PORTS
+```
+**Check**: Compare prompt in `scripts/eval_gpqa.py` with OC format above. Fix if different.
+
+### 6. IFEval (541 problems, ~5 min)
+```bash
+python scripts/eval_ifeval.py --ports $PORTS
+```
+
+### 7. GSM8K (full 1319 problems, ~5 min)
+```bash
+python scripts/eval_gsm8k.py --num-problems 1319 --ports $PORTS
+```
+
+### 8. Math500 (500 problems, ~5 min)
+```bash
+python scripts/eval_math500.py --ports $PORTS
+```
+
+### 9. MathBench (circular eval, ~30 min)
+**Data**: `/data/cxu/dllm-distillation/evaluation/opencompass/.cache/opencompass/data/mathbench_v1/`
+**Metric**: `perf_4` (all 4 circular shifts must be correct) — matches OC default
+```bash
+python scripts/eval_mathbench.py --ports $PORTS
+```
+
+### 10. AIME 2024 (30 problems, ~3 min)
+```bash
+python scripts/eval_aime.py --year 2024 --num-problems 30 --ports $PORTS
+```
+
+### 11. AIME 2025 (30 problems, ~3 min)
+```bash
+python scripts/eval_aime.py --year 2025 --num-problems 30 --ports $PORTS
+```
+
+### 12. HumanEval+ (164 problems, ~3 min)
+```bash
+python scripts/eval_humaneval.py --ports $PORTS
+```
+
+### 13. MBPP+ (257 problems, ~3 min)
+```bash
+python scripts/eval_mbpp.py --ports $PORTS
+```
+
+### 14. LCB-v6 (175 problems, ~15 min with OC evaluator)
+```bash
+python scripts/eval_lcb.py --version 6 --max-workers 16 --ports $PORTS --output-dir bench_results/lcb_$MODEL
+```
+
+### 15. CMMLU (random 2000 from 11.5k, ~15 min)
+```bash
+python scripts/eval_cmmlu.py --num-problems 2000 --ports $PORTS
+```
+
+## Execution Order
+**Run DLLM first (ports 30000-30007), then launch Qwen3-8B and run same benchmarks.**
+
+For DLLM:
+1. ARC-C, TriviaQA, MMLU, MMLU-Pro (can run in parallel as separate scripts)
+2. GPQA, IFEval, GSM8K, Math500
+3. MathBench (long, circular), AIME-24, AIME-25
+4. HumanEval+, MBPP+, LCB-v6, CMMLU
+
+For Qwen3-8B: same order, same scripts with QWEN_PORTS.
+
+## After Each Benchmark: Quality Check Protocol
+For each completed benchmark, check:
+1. **Truncation**: count finish_reason='length'. If >10% truncated → this is already at 32k so note as "model needs long thinking"
+2. **No extraction**: count pred='?'. If >5% → fix extraction regex and rerun
+3. **Sample wrong answers**: print 3-5 examples, check if failure is model error vs extraction error
+4. **OC alignment**: verify prompt matches OpenCompass format (see OC configs at `/data/cxu/dllm-distillation/evaluation/opencompass/opencompass/configs/datasets/`)
+
+If extraction failure >5%: FIX the script and rerun before moving to next benchmark.
+
+## OC Prompt Alignment Notes
+Key prompts to verify/fix before running:
+
+**TriviaQA**: prompt should be:
+`"Answer these questions, your answer should be as simple as possible, start your answer with the prompt 'The answer is '.\nQ: {question}?"`
+Then extract "The answer is X" from response.
+
+**GPQA**: prompt should end with `"ANSWER: $LETTER"` format instruction.
+Extraction: look for `ANSWER: [ABCD]` at end of response.
+
+**MMLU**: standard 4-choice format. Extract last letter A/B/C/D.
+
+**MathBench**: use OC's circular eval. perf_4 = all 4 permutations correct.
+
+**LCB**: use OC's `run_test` evaluator (already implemented in eval_lcb.py).
+
+## Results Recording
+Update PLAN.md results table after each benchmark completes.
+
+## Important Constraints
+- Always use `--max-tokens 32768`
+- Do NOT kill DLLM servers (ports 30000-30007) unless explicitly needed
+- Qwen3-8B runs on ports 30010-30017 (separate GPUs)
+- If a server crashes, restart it before continuing
+- Record both DLLM and Qwen3-8B results in the same table

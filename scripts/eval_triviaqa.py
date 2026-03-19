@@ -45,7 +45,7 @@ def check_answer(pred, gold_answers):
 
 def run_one(args):
     idx, question, gold_answers, port, max_tokens, timeout, temperature, top_p, top_k = args
-    prompt = f"Answer the following question concisely.\n\nQuestion: {question}\nAnswer:"
+    prompt = f"Answer these questions, your answer should be as simple as possible, start your answer with the prompt 'The answer is '.\nQ: {question}?"
     try:
         r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={
             "model": "default",

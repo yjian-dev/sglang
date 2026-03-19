@@ -20,10 +20,14 @@ class LowConfidence(DllmAlgorithm):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
 
+    def cleanup_request(self, req_pool_idx: int):
+        pass
+
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
+        overlap_fn=None,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
         batch_size = forward_batch.batch_size
         # Here, the forward_batch full logits contains all the blocks

@@ -1,162 +1,95 @@
-# Plan — Benchmark Evaluation (DLLM N=3 vs Qwen3-8B)
+# Plan — Full Benchmark Suite (DLLM N=3 vs Qwen3-8B)
 
 ## Status
-In progress — running missing benchmarks
+Not started
 
-## Current Model (DO NOT RESTART)
-- `/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont`
-- N=3 sampling, 8×TP=1, ports 30000-30007
+## Models
+- **DLLM N=3**: `sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont` — DreamShiftBlockN N=3 sampling, ports 30000-30007 (**already running**)
+- **Qwen3-8B**: `Qwen/Qwen3-8B` — standard AR with thinking, ports 30010-30017 (launch when needed)
 
 ## Results Table
 
-| Benchmark | Ours (DLLM N=3) | Qwen3-8B | Notes |
-|-----------|-----------------|----------|-------|
-| ARC-C | | | TODO |
-| TriviaQA | | | TODO |
-| MMLU | | | TODO |
-| MMLU-Pro | | | TODO — prev run biased, need random 2k |
-| GPQA-Diamond | 59.1% | 48.01% | ✓ done |
-| IFEval | 87.4% | | ✓ done (DLLM), Qwen TODO |
-| GSM8K | 96% | | ✓ done (DLLM), Qwen TODO |
-| Math500 | 95.2% | | ✓ done (DLLM), Qwen TODO |
-| MathBench | | | TODO |
-| AIME-2025 | 61.04% | | ✓ done (DLLM), Qwen TODO |
-| HumanEval+ | 93.9% | | ✓ done (DLLM), Qwen TODO |
-| MBPP+ | 91.8% | | ✓ done (DLLM), Qwen TODO |
-| HumanEval-X Python | 86.6% | | ✓ done (DLLM), Qwen TODO |
-| LCB-v6 | 45.1% | | ✓ done (DLLM), Qwen TODO |
-| CMMLU | | | TODO |
-| MMMLU-lite | | | TODO |
+| Benchmark | DLLM N=3 | Qwen3-8B | Notes |
+|-----------|----------|----------|-------|
+| ARC-C (full) | | | |
+| TriviaQA (1k) | | | |
+| MMLU (2k rand) | | | |
+| MMLU-Pro (2k rand) | | | |
+| GPQA-Diamond (198) | | | |
+| IFEval (541) | | | |
+| GSM8K (1319) | | | |
+| Math500 (500) | | | |
+| MathBench (perf_4) | | | |
+| AIME-2024 (30) | | | |
+| AIME-2025 (30) | | | |
+| HumanEval+ (164) | | | |
+| MBPP+ (257) | | | |
+| LCB-v6 (175) | | | |
+| CMMLU (2k rand) | | | |
 
 ## Tasks
 
-### Phase 1: Complete missing DLLM benchmarks
+### Phase 1: Fix & Verify Scripts (do BEFORE running)
+- [ ] Check `eval_triviaqa.py` prompt matches OC: "Answer these questions... start your answer with 'The answer is '"
+- [ ] Check `eval_gpqa.py` prompt matches OC: "ANSWER: $LETTER" format at end, extract `ANSWER: [ABCD]`
+- [ ] Verify `eval_mmlu.py` uses random seed=42 sampling
+- [ ] Verify `eval_mmlu_pro.py` uses random seed=42 sampling
+- [ ] Verify `eval_cmmlu.py` uses random seed=42 sampling
+- [ ] Verify all scripts default to `--max-tokens 32768`
 
-- [ ] **ARC-C** — create `scripts/eval_arc_c.py`, run, check errors
-- [ ] **MMLU** — create `scripts/eval_mmlu.py` (distributed version), run 2k random
-- [ ] **MMLU-Pro** — fix random sampling in `scripts/eval_mmlu_pro.py`, run 2k random
-- [ ] **CMMLU** — create `scripts/eval_cmmlu.py`, run 2k random
-- [ ] **MMMLU-lite** — create `scripts/eval_mmmlu.py`, run 200/language × 6 languages
-- [ ] **MathBench** — create `scripts/eval_mathbench.py`, run 1k
-- [ ] **TriviaQA** — run `scripts/eval_triviaqa.py --num-problems 1000`
-- [ ] **LongBench-v2 Hard** — create `scripts/eval_longbench_hard.py` (skip if OOM)
+### Phase 2: DLLM N=3 Benchmarks (ports 30000-30007)
+- [ ] ARC-C
+- [ ] TriviaQA
+- [ ] MMLU
+- [ ] MMLU-Pro
+- [ ] GPQA-Diamond
+- [ ] IFEval
+- [ ] GSM8K
+- [ ] Math500
+- [ ] MathBench (circular perf_4)
+- [ ] AIME-2024
+- [ ] AIME-2025
+- [ ] HumanEval+
+- [ ] MBPP+
+- [ ] LCB-v6
+- [ ] CMMLU
 
-### Phase 2: Error diagnosis for each completed benchmark
-For EACH benchmark:
-- [ ] Check wrong examples (print first 10 failures)
-- [ ] Count: (a) truncated (finish_reason=length), (b) no extraction (pred=?), (c) wrong answer
-- [ ] If truncated >10%: increase max_tokens to 32768, re-run
-- [ ] If no extraction >5%: fix regex/prompt, re-run
-- [ ] Document root cause in notes column of results table
+### Phase 3: Qwen3-8B Benchmarks (ports 30010-30017)
+- [ ] Launch Qwen3-8B (8×TP=1)
+- [ ] Run all 15 benchmarks with QWEN_PORTS
 
-### Phase 3: Qwen3-8B comparison
-Launch Qwen3-8B on ports 30010-30017:
-```bash
-source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
-export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
-export CUDA_HOME=/usr/local/cuda-12.9
-for gpu in 0 1 2 3 4 5 6 7; do
-  port=$((30010 + gpu))
-  CUDA_VISIBLE_DEVICES=$gpu nohup python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-8B --trust-remote-code --tp-size 1 \
-    --mem-fraction-static 0.85 --max-running-requests 64 \
-    --attention-backend flashinfer \
-    --dtype bfloat16 --port $port --chunked-prefill-size 4096 \
-    > /tmp/sglang_qwen_gpu${gpu}.log 2>&1 &
-done
-# Wait for all 8 healthy (ports 30010-30017)
-for i in $(seq 0 7); do
-  port=$((30010+i))
-  for j in $(seq 1 60); do
-    curl -sf http://localhost:$port/health > /dev/null 2>&1 && echo "GPU $i ready" && break
-    sleep 5
-  done
-done
-```
+### Quality Check (after EACH benchmark)
+For each result, check and record in notes column:
+- truncation rate (finish_reason='length')
+- extraction failure rate (pred='?')
+- sample wrong answers reviewed
 
-Then run all benchmark scripts with `--ports 30010 30011 30012 30013 30014 30015 30016 30017`
+## OC Alignment Checklist
+Reference: `/data/cxu/dllm-distillation/evaluation/opencompass/opencompass/configs/datasets/`
 
-**Already have Qwen3-8B reference numbers** (from LLaDA paper):
-- GPQA: 48.01%, MMLU-Pro: 65.83%, IFEval: 84.29%, GSM+: 85.56%, LCB: 26.76%
-- For benchmarks not in paper, measure directly
-
-## Script Convention
-All scripts must:
-- Default `--max-tokens 16384`
-- Use `/v1/chat/completions` with thinking model format
-- Strip `<think>...</think>` before answer extraction
-- Print sample wrong answers at end
-- Support `--ports` for multi-GPU distribution
+| Benchmark | OC Prompt Key | Our Script Status |
+|-----------|--------------|-------------------|
+| TriviaQA | "The answer is " prefix | check |
+| GPQA | "ANSWER: $LETTER" at end | check |
+| MMLU | standard 4-choice | check |
+| MMLU-Pro | 10-choice (A-J) | check |
+| GSM8K | \\boxed{} | check |
+| Math500 | \\boxed{} | check |
+| MathBench | circular perf_4 | ✓ implemented |
+| LCB-v6 | OC run_test evaluator | ✓ implemented |
+| CMMLU | 4-choice CN | check |
+| IFEval | instruction format | check |
 
 ## Environment
 ```bash
 source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
 export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-12.9
-HF_TOKEN=<your_hf_token>  # for gated datasets like GPQA
+export HF_HOME=/data/yjian/hf_cache
+export HUGGINGFACE_HUB_CACHE=/data/yjian/hf_cache/hub
+export FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache
+export HF_TOKEN=<your_hf_token>
 ```
 
 ## Progress Log
-- 2026-03-18: LCB-v6 45.1% confirmed with OC evaluator (reliability_guard fix)
-- 2026-03-18: eval scripts pushed to jyq/dreamshift-blockN-accuracy-fix
-- Started Phase 1 (missing benchmarks)
-
-
-## Evaluator Feedback (Iteration 1)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 2)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 3)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 4)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 5)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 6)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 7)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 8)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 9)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 10)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 11)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 12)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 13)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 14)
-Could not parse evaluator response.
-
-
-## Evaluator Feedback (Iteration 15)
-Could not parse evaluator response.
+<!-- Agent updates this after each step -->

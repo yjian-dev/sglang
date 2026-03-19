@@ -23,10 +23,14 @@ class JointThreshold(DllmAlgorithm):
         )
         self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
 
+    def cleanup_request(self, req_pool_idx: int):
+        pass
+
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
+        overlap_fn=None,
     ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
@@ -128,10 +132,12 @@ class JointThreshold(DllmAlgorithm):
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
-        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
+        next_token_ids_list = []
+        for i in range(batch_size):
+            block_start = i * self.block_size
+            block_end = block_start + self.block_size
+            block_ids = forward_batch.input_ids[block_start:block_end]
+            next_token_ids_list.append(block_ids[start_list[i]:])
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

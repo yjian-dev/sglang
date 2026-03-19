@@ -25,8 +25,13 @@ def strip_thinking(text):
 
 
 def extract_choice(text):
-    """Extract single letter choice (A-D) from model output."""
+    """Extract A-D from model output. OC format: last line 'ANSWER: X'."""
     text = strip_thinking(text)
+    # OC primary: "ANSWER: X" (from simple_eval prompt)
+    m = re.search(r"ANSWER:\s*([A-Da-d])", text)
+    if m:
+        return m.group(1).upper()
+    # Fallback: "The answer is X"
     m = re.search(r"[Aa]nswer is:?\s*\(?([A-Da-d])\)?", text)
     if m:
         return m.group(1).upper()
@@ -62,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-problems", type=int, default=0, help="0 = all")
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
@@ -95,11 +100,14 @@ def main():
         gold_idx = indices.index(0)  # Correct Answer was at index 0
         gold_letter = "ABCD"[gold_idx]
 
-        letters = "ABCD"
-        choices_str = "\n".join(f"{letters[i]}. {shuffled[i]}" for i in range(4))
+        # OC format: "A) choice\nB) choice..." with "ANSWER: $LETTER" instruction
+        choices_str = "\n".join(f"{'ABCD'[i]}) {shuffled[i]}" for i in range(4))
         prompt = (
-            f"{q}\n\n{choices_str}\n\n"
-            "Think step by step, then give your answer as \"The answer is (X)\"."
+            "Answer the following multiple choice question. "
+            "The last line of your response should be of the following format: "
+            "'ANSWER: $LETTER' (without quotes) where LETTER is one of ABCD. "
+            "Think step by step before answering.\n\n"
+            f"{q}\n\n{choices_str}"
         )
         problems.append((prompt, gold_letter))
 
