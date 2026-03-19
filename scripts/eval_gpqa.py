@@ -66,6 +66,9 @@ def run_one(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-problems", type=int, default=0, help="0 = all")
+    parser.add_argument("--subset", type=str, default="diamond",
+                        choices=["diamond", "main", "extended"],
+                        help="GPQA subset: diamond(198), main(448), extended(546)")
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
     parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -76,7 +79,9 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
-    ds = load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
+    subset_map = {"diamond": "gpqa_diamond", "main": "gpqa_main", "extended": "gpqa_extended"}
+    hf_subset = subset_map[args.subset]
+    ds = load_dataset("Idavidrein/gpqa", hf_subset, split="train")
     N = min(args.num_problems, len(ds)) if args.num_problems > 0 else len(ds)
     ports = args.ports
 
@@ -111,7 +116,7 @@ def main():
         )
         problems.append((prompt, gold_letter))
 
-    print(f"GPQA Diamond eval: {N} problems, {len(ports)} servers")
+    print(f"GPQA {args.subset} eval: {N} problems, {len(ports)} servers")
 
     tasks = [
         (i, p, g, ports[i % len(ports)], args.max_tokens, args.timeout,
@@ -139,7 +144,7 @@ def main():
 
     acc = correct / N * 100
     print(f"\n{'=' * 60}")
-    print(f"GPQA Diamond {N} problems, {len(ports)} GPUs")
+    print(f"GPQA {args.subset} {N} problems, {len(ports)} GPUs")
     print(f"{'=' * 60}")
     print(f"Accuracy:       {correct}/{N} ({acc:.1f}%)")
     print(f"Total tokens:   {total_tok:,}")
@@ -158,7 +163,7 @@ def main():
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "gpqa_summary.json"), "w") as f:
+        with open(os.path.join(args.output_dir, f"gpqa_{args.subset}_summary.json"), "w") as f:
             json.dump({"accuracy": acc, "correct": correct, "total": N,
                        "tokens": total_tok}, f, indent=2)
 
