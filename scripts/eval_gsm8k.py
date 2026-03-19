@@ -97,7 +97,7 @@ def main():
     print(f"GSM8K {N} problems, {len(ports)} GPUs")
     print(f"{'=' * 60}")
     print(f"Accuracy:          {correct}/{N} ({correct / N * 100:.1f}%)")
-    if errors > 0:
+    if errors > 0 and N - errors > 0:
         print(f"Accuracy (no err): {correct}/{N - errors} ({correct / (N - errors) * 100:.1f}%)")
     print(f"Total tokens:      {total_tok:,}")
     print(f"Wall time:         {elapsed:.1f}s")

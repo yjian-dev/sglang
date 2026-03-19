@@ -97,11 +97,22 @@ Phase 2 and Phase 3 mostly complete. Only GPQA (both models) blocked on HF_TOKEN
 - DLLM beats Qwen3-8B on HumanEval (78.7% vs 74.4%) and ties on MBPP
 - Largest gaps: AIME-2025 (43.3% vs 60.0%), AIME-2024 (66.7% vs 76.7%), MathBench (88.3% vs 93.1%)
 
-### Next steps (iteration 3)
-- Need HF_TOKEN from user for GPQA (both DLLM and Qwen3-8B)
-- Qwen3-8B servers still running on ports 30010-30017
-- To run DLLM GPQA: need to restart DLLM servers (or use existing Qwen servers for Qwen GPQA first)
+### Iteration 3 (2026-03-19)
+- Fixed division-by-zero bug in eval_gsm8k.py line 101 (N - errors == 0 case)
+- Asked user for HF_TOKEN — no response yet
+- GPQA remains the only blocked benchmark (both DLLM and Qwen3-8B)
+- Qwen3-8B servers confirmed still running on ports 30010-30017
+- DLLM servers still down (ports 30000-30007)
+
+### Next steps (iteration 4)
+- If user provides HF_TOKEN: run Qwen3-8B GPQA main + diamond first (servers already running), then restart DLLM servers and run DLLM GPQA main
+- If no HF_TOKEN: mark GPQA as N/A and consider suite complete (14/16 benchmarks done)
+- All other benchmarks complete — 96.1% avg DLLM/Qwen quality ratio
 
 ## Evaluator Feedback (Iteration 1)
 1. Obtain HF_TOKEN from user to unblock GPQA (both DLLM and Qwen3-8B). 2. Run remaining DLLM benchmarks: GPQA, IFEval, GSM8K, Math500, MathBench, AIME-2024, AIME-2025, HumanEval, MBPP, LCB-v6. 3. Kill DLLM servers, launch Qwen3-8B on ports 30000-30007, and run all 15+ Qwen3-8B benchmarks. 4. For each benchmark, record quality check notes (truncation rate, extraction failure rate). 5. Use max_tokens=4096 for thinking-heavy benchmarks (like CMMLU) to avoid OOM.
 HF_TOKEN = <see user>
+
+
+## Evaluator Feedback (Iteration 2)
+1. Obtain HF_TOKEN from the user to unblock GPQA evaluation — this is the single remaining blocker for completion. 2. Restart DLLM servers on ports 30000-30007 (all GPUs currently DOWN). 3. Run GPQA main (448 problems) for DLLM N=3 with HF_TOKEN set. 4. Launch Qwen3-8B servers and run GPQA main + GPQA-Diamond for Qwen3-8B. 5. Fix the division-by-zero bug in eval_gsm8k.py line 101 (handle case where N - errors == 0). 6. If HF_TOKEN cannot be obtained, discuss with the user whether to mark GPQA as N/A and consider the remaining 14 benchmarks sufficient for completion.
