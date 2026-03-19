@@ -121,8 +121,12 @@ def main():
     print(f"Total CMMLU test problems: {len(all_items)}")
 
     random.seed(42)
-    N = min(args.num_problems, len(all_items))
-    sampled = random.sample(all_items, N)
+    if args.num_problems > 0 and args.num_problems < len(all_items):
+        N = args.num_problems
+        sampled = random.sample(all_items, N)
+    else:
+        N = len(all_items)
+        sampled = all_items
     ports = args.ports
 
     LETTERS = "ABCD"

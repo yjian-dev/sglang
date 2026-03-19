@@ -33,8 +33,16 @@ def normalize_answer(s):
     return " ".join(s.split())
 
 
+def extract_answer(text):
+    """Extract answer after 'The answer is' (OC-style extraction)."""
+    m = re.search(r"[Tt]he answer is\s+(.+?)(?:[.\n]|$)", text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
 def check_answer(pred, gold_answers):
-    """Check if prediction matches any gold answer (exact or contains)."""
+    """Check if extracted answer matches any gold answer."""
     pred_norm = normalize_answer(pred)
     for gold in gold_answers:
         gold_norm = normalize_answer(gold)
@@ -57,8 +65,10 @@ def run_one(args):
         }, timeout=timeout).json()
         content = r["choices"][0]["message"]["content"]
         content = strip_thinking(content)
+        # Extract just the answer part after "The answer is"
+        answer = extract_answer(content)
         comp = r["usage"]["completion_tokens"]
-        return idx, content, gold_answers, comp, None
+        return idx, answer, gold_answers, comp, None
     except Exception as e:
         return idx, "", gold_answers, 0, str(e)
 
@@ -67,7 +77,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-problems", type=int, default=0, help="0=full dataset")
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
-    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--max-tokens", type=int, default=4096,
+                        help="4096 enough for thinking models; DLLM can use 256")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
@@ -77,7 +88,7 @@ def main():
     args = parser.parse_args()
 
     ds = load_dataset("trivia_qa", "rc.nocontext", split="validation")
-    N = min(args.num_problems, len(ds))
+    N = min(args.num_problems, len(ds)) if args.num_problems > 0 else len(ds)
     ports = args.ports
 
     problems = []

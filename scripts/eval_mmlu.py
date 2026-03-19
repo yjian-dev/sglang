@@ -83,9 +83,13 @@ def main():
     print(f"Total MMLU problems: {len(ds)}")
 
     random.seed(42)
-    N = min(args.num_problems, len(ds))
-    indices = random.sample(range(len(ds)), N)
-    subset = ds.select(indices)
+    if args.num_problems > 0 and args.num_problems < len(ds):
+        N = args.num_problems
+        indices = random.sample(range(len(ds)), N)
+        subset = ds.select(indices)
+    else:
+        N = len(ds)
+        subset = ds
     ports = args.ports
 
     LETTERS = "ABCD"

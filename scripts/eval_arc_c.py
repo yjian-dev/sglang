@@ -39,12 +39,18 @@ def extract_choice(text):
     return "?"
 
 
+def normalize_label(label):
+    """Convert numeric labels (1,2,3,4) to letters (A,B,C,D)."""
+    num_to_letter = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E"}
+    return num_to_letter.get(label, label)
+
+
 def format_choices(choices):
     labels = choices["label"]
     texts = choices["text"]
     lines = []
     for l, t in zip(labels, texts):
-        lines.append(f"{l}. {t}")
+        lines.append(f"{normalize_label(l)}. {t}")
     return "\n".join(lines)
 
 
@@ -98,7 +104,7 @@ def main():
     for item in ds:
         q = item["question"]
         choices_str = format_choices(item["choices"])
-        gold = item["answerKey"]
+        gold = normalize_label(item["answerKey"])
         problems.append((q, choices_str, gold))
 
     print(f"ARC-Challenge eval: {N} problems, {len(ports)} servers")

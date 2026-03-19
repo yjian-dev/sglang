@@ -111,7 +111,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=2024, choices=[2024, 2025])
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
-    parser.add_argument("--max-tokens", type=int, default=16384)
+    parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--num-problems", type=int, default=None)
     parser.add_argument("--num-samples", type=int, default=1, help="samples per problem for majority vote")
