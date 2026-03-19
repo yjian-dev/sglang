@@ -45,7 +45,7 @@ def run_one(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-problems", type=int, default=200)
+    parser.add_argument("--num-problems", type=int, default=0, help="0=full dataset (1319)")
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -58,7 +58,7 @@ def main():
     args = parser.parse_args()
 
     ds = load_dataset("gsm8k", "main", split="test")
-    N = min(args.num_problems, len(ds))
+    N = len(ds) if args.num_problems == 0 else min(args.num_problems, len(ds))
     problems = [(item["question"], item["answer"].split("####")[-1].strip().replace(",", ""))
                 for item in ds.select(range(N))]
     ports = args.ports

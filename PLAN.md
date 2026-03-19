@@ -11,31 +11,33 @@ Not started
 
 | Benchmark | DLLM N=3 | Qwen3-8B | Notes |
 |-----------|----------|----------|-------|
-| ARC-C (full) | | | |
-| TriviaQA (1k) | | | |
-| MMLU (2k rand) | | | |
-| MMLU-Pro (2k rand) | | | |
+| ARC-C (1172) | | | |
+| TriviaQA (full ~11k) | | | |
+| MMLU (full ~14k) | | | |
+| MMLU-Pro (full ~12k) | | | |
 | GPQA-Diamond (198) | | | |
 | IFEval (541) | | | |
 | GSM8K (1319) | | | |
 | Math500 (500) | | | |
-| MathBench (perf_4) | | | |
+| MathBench (full, perf_4) | | | |
 | AIME-2024 (30) | | | |
 | AIME-2025 (30) | | | |
 | HumanEval+ (164) | | | |
 | MBPP+ (257) | | | |
 | LCB-v6 (175) | | | |
-| CMMLU (2k rand) | | | |
+| CMMLU (full ~11.5k) | | | |
 
 ## Tasks
 
 ### Phase 1: Fix & Verify Scripts (do BEFORE running)
-- [ ] Check `eval_triviaqa.py` prompt matches OC: "Answer these questions... start your answer with 'The answer is '"
-- [ ] Check `eval_gpqa.py` prompt matches OC: "ANSWER: $LETTER" format at end, extract `ANSWER: [ABCD]`
-- [ ] Verify `eval_mmlu.py` uses random seed=42 sampling
-- [ ] Verify `eval_mmlu_pro.py` uses random seed=42 sampling
-- [ ] Verify `eval_cmmlu.py` uses random seed=42 sampling
-- [ ] Verify all scripts default to `--max-tokens 32768`
+- [x] `eval_triviaqa.py` prompt: OC format "The answer is " ✓
+- [x] `eval_gpqa.py` prompt: OC format "ANSWER: $LETTER" ✓
+- [x] All scripts: default max_tokens=32768 ✓
+- [ ] Remove ALL `--num-problems` limits: MMLU/MMLU-Pro/CMMLU/TriviaQA must run full dataset
+- [ ] `eval_mmlu.py`: remove `--num-problems` default (or set 0=full)
+- [ ] `eval_mmlu_pro.py`: remove `--num-problems` default
+- [ ] `eval_cmmlu.py`: remove `--num-problems` default
+- [ ] `eval_triviaqa.py`: run full validation set (no limit)
 
 ### Phase 2: DLLM N=3 Benchmarks (ports 30000-30007)
 - [ ] ARC-C

@@ -65,7 +65,7 @@ def run_one(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-problems", type=int, default=1000)
+    parser.add_argument("--num-problems", type=int, default=0, help="0=full dataset")
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=1.0)

@@ -52,21 +52,23 @@ QWEN_PORTS="30010 30011 30012 30013 30014 30015 30016 30017"
 python scripts/eval_arc_c.py --ports $PORTS
 ```
 
-### 2. TriviaQA (1000 problems, ~3 min)
+### 2. TriviaQA (FULL ~11k validation set, ~2-3 hrs)
 **OC prompt**: "Answer these questions... start your answer with 'The answer is '"
-**Our prompt**: must match this pattern. Check `scripts/eval_triviaqa.py`.
+**IMPORTANT**: Run full dataset, NO --num-problems limit.
 ```bash
-python scripts/eval_triviaqa.py --num-problems 1000 --ports $PORTS
+python scripts/eval_triviaqa.py --ports $PORTS
 ```
 
-### 3. MMLU (random 2000 from 14k, ~10 min)
+### 3. MMLU (FULL ~14k, ~6-8 hrs)
+**IMPORTANT**: Run full dataset, NO --num-problems limit.
 ```bash
-python scripts/eval_mmlu.py --num-problems 2000 --ports $PORTS
+python scripts/eval_mmlu.py --ports $PORTS
 ```
 
-### 4. MMLU-Pro (random 2000 from 12k, ~15 min)
+### 4. MMLU-Pro (FULL ~12k, ~5-7 hrs)
+**IMPORTANT**: Run full dataset, NO --num-problems limit.
 ```bash
-python scripts/eval_mmlu_pro.py --num-problems 2000 --ports $PORTS
+python scripts/eval_mmlu_pro.py --ports $PORTS
 ```
 
 ### 5. GPQA-Diamond (198 problems, ~5 min)
@@ -84,7 +86,7 @@ python scripts/eval_ifeval.py --ports $PORTS
 
 ### 7. GSM8K (full 1319 problems, ~5 min)
 ```bash
-python scripts/eval_gsm8k.py --num-problems 1319 --ports $PORTS
+python scripts/eval_gsm8k.py --ports $PORTS
 ```
 
 ### 8. Math500 (500 problems, ~5 min)
@@ -124,9 +126,9 @@ python scripts/eval_mbpp.py --ports $PORTS
 python scripts/eval_lcb.py --version 6 --max-workers 16 --ports $PORTS --output-dir bench_results/lcb_$MODEL
 ```
 
-### 15. CMMLU (random 2000 from 11.5k, ~15 min)
+### 15. CMMLU (FULL ~11.5k, ~5-8 hrs)
 ```bash
-python scripts/eval_cmmlu.py --num-problems 2000 --ports $PORTS
+python scripts/eval_cmmlu.py --ports $PORTS
 ```
 
 ## Execution Order
