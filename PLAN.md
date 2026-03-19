@@ -134,3 +134,7 @@ HF_TOKEN = <see user>
 
 ## Evaluator Feedback (Iteration 3)
 1. Ask the user for HF_TOKEN to unblock GPQA — this is the single remaining blocker. If the user cannot provide it, ask whether to mark GPQA as N/A and declare 14/15 benchmarks sufficient. 2. If HF_TOKEN is provided: run Qwen3-8B GPQA main + diamond first (restart Qwen3-8B servers if needed), then restart DLLM servers on ports 30000-30007 and run DLLM GPQA main. 3. If user agrees to skip GPQA: update PLAN.md to mark GPQA as N/A with explanation, update the results table accordingly, and declare completion with 14 benchmarks.
+
+
+## Evaluator Feedback (Iteration 4)
+1. Obtain HF_TOKEN from the user — this has been the single blocker for 4 iterations. Explicitly ask: 'Can you provide HF_TOKEN, or should I mark GPQA as N/A and treat 14 benchmarks as sufficient?' 2. If user agrees to skip GPQA, update the success condition to reflect 14 benchmarks (excluding GPQA) and re-evaluate. 3. If HF_TOKEN is provided: restart DLLM servers on ports 30000-30007, run GPQA main for DLLM N=3, then restart Qwen3-8B servers and run GPQA main + GPQA-Diamond. 4. Ensure at least one set of servers is running so the sanity test command passes.
