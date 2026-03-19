@@ -120,8 +120,18 @@
 - Qwen3-8B servers still running on 30010-30017 (can be shut down)
 - DLLM servers remain down (30000-30007)
 
+### Iteration 6 (2026-03-19)
+- Confirmed Qwen3-8B servers still running on ports 30010-30017
+- DLLM servers remain down (ports 30000-30007)
+- No HF_TOKEN found in environment or cached credentials
+- GPQA blocked for 6 consecutive iterations — requesting user decision
+- **ACTION NEEDED**: User must either provide HF_TOKEN or confirm 14-benchmark scope is sufficient
+
 ### Final Status
-**SUITE COMPLETE** — 14 benchmarks evaluated across 4 categories (Knowledge, Math, Code, Instruction Following). GPQA skipped due to missing HF_TOKEN. To run GPQA later, provide HF_TOKEN and restart the relevant servers.
+**SUITE COMPLETE (14/16)** — 14 benchmarks evaluated across 4 categories (Knowledge, Math, Code, Instruction Following). GPQA (2 configs) excluded due to missing HF_TOKEN (blocked since iteration 1). To run GPQA later, provide HF_TOKEN and restart the relevant servers.
+
+## Success Condition (Pending User Confirmation)
+14 benchmarks complete with results for both DLLM N=3 and Qwen3-8B. GPQA excluded due to missing HF_TOKEN. Awaiting user decision: provide HF_TOKEN to run GPQA, or confirm 14 benchmarks is sufficient.
 
 ## Evaluator Feedback (Iteration 1)
 1. Obtain HF_TOKEN from user to unblock GPQA (both DLLM and Qwen3-8B). 2. Run remaining DLLM benchmarks: GPQA, IFEval, GSM8K, Math500, MathBench, AIME-2024, AIME-2025, HumanEval, MBPP, LCB-v6. 3. Kill DLLM servers, launch Qwen3-8B on ports 30000-30007, and run all 15+ Qwen3-8B benchmarks. 4. For each benchmark, record quality check notes (truncation rate, extraction failure rate). 5. Use max_tokens=4096 for thinking-heavy benchmarks (like CMMLU) to avoid OOM.
@@ -138,3 +148,7 @@ HF_TOKEN = <see user>
 
 ## Evaluator Feedback (Iteration 4)
 1. Obtain HF_TOKEN from the user — this has been the single blocker for 4 iterations. Explicitly ask: 'Can you provide HF_TOKEN, or should I mark GPQA as N/A and treat 14 benchmarks as sufficient?' 2. If user agrees to skip GPQA, update the success condition to reflect 14 benchmarks (excluding GPQA) and re-evaluate. 3. If HF_TOKEN is provided: restart DLLM servers on ports 30000-30007, run GPQA main for DLLM N=3, then restart Qwen3-8B servers and run GPQA main + GPQA-Diamond. 4. Ensure at least one set of servers is running so the sanity test command passes.
+
+
+## Evaluator Feedback (Iteration 5)
+1. Explicitly ask the user: 'Can you provide HF_TOKEN, or should we formally reduce the target to 14 benchmarks (excluding GPQA) and update the success condition?' This has been blocked for 4 iterations — a decision is needed. 2. If user agrees to skip GPQA: update the success condition to '14 benchmarks (GPQA excluded due to missing HF_TOKEN)' and re-run evaluation. 3. If HF_TOKEN is provided: restart DLLM servers on ports 30000-30007, run GPQA main for DLLM, then swap to Qwen3-8B and run GPQA main + diamond. 4. Ensure at least one model's servers are running so the health-check and sanity test commands pass before declaring completion.
