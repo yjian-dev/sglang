@@ -1,10 +1,9 @@
-# LLaDA2.1-mini - Quality Mode with scheduled transfer
-block_size: 32
-steps: 32
-threshold: 0.7
-edit_threshold: 0.5
+# LLaDA2.1-mini - Quality Mode matching official HF generate defaults
+# bl=4 works around sglang bl=32 denoising quality bug
+block_size: 4
+steps: 4
+threshold: 0.95
+edit_threshold: 0.9
 max_post_edit_steps: 16
-temperature: 1.0
-top_k: 50
-top_p: 0.95
+temperature: 0.0
 penalty_lambda: 0

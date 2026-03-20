@@ -1,0 +1,8 @@
+# LLaDA2.1-mini - Quality Mode with block_size=4
+block_size: 4
+steps: 4
+threshold: 0.95
+edit_threshold: 0.9
+max_post_edit_steps: 16
+temperature: 0.0
+penalty_lambda: 0
