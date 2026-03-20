@@ -81,6 +81,11 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        # Allow YAML to override causal_prefill (some models have
+        # use_regular_causal=None but still need causal prefill).
+        if algorithm_config.get("causal_prefill") is not None:
+            causal_prefill = algorithm_config["causal_prefill"]
+
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,

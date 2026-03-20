@@ -223,11 +223,17 @@ class DreamShiftBlockN(DllmAlgorithm):
             "phase4_trim_assemble": 0.0,
             "timing_count": 0,
         }
+        # Conditional LoRA: base-only for verify/committed, base+LoRA for MASK positions
+        self.conditional_lora: bool = config.algorithm_config.get(
+            "conditional_lora", False
+        )
+
         self._timing_enabled = False  # Set True for profiling (adds GPU sync overhead!)
         logger.info(
             f"[DreamShiftBlockN] gen_block_size={self.gen_block_size}, "
             f"block_size={self.block_size}, num_masks={self.num_masks}, "
-            f"spec_verify={self.use_spec_verify}, verify_alpha={self.verify_alpha}"
+            f"spec_verify={self.use_spec_verify}, verify_alpha={self.verify_alpha}, "
+            f"conditional_lora={self.conditional_lora}"
         )
 
     def cleanup_request(self, req_pool_idx: int):
@@ -243,6 +249,61 @@ class DreamShiftBlockN(DllmAlgorithm):
         self._spec_tokens.pop(req_pool_idx, None)
         self._spec_draft_probs.pop(req_pool_idx, None)
         self._force_next_token.pop(req_pool_idx, None)
+
+    def _setup_conditional_lora(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        extend_lens_cpu: List[int],
+        is_prefill: List[bool],
+        case_types: List[str],
+        old_specs: List,
+    ):
+        """Set per-token LoRA segments: None for base tokens, lora_id for MASK tokens.
+
+        Matches reference generate.py L3137-3142:
+          lora_mask = [0]*n_verify + [1]*num_masks
+        """
+        blk = self.block_size
+        lora_ids = forward_batch.lora_ids
+        segment_ids: List[Union[str, None]] = []
+        segment_lens: List[int] = []
+
+        for bid, extend_len in enumerate(extend_lens_cpu):
+            req_lora_id = lora_ids[bid]
+            if extend_len <= 0:
+                continue
+
+            # Prefill or no LoRA → single segment, all base
+            if req_lora_id is None or is_prefill[bid] or case_types[bid] == "P":
+                segment_ids.append(None)
+                segment_lens.append(extend_len)
+                continue
+
+            # Compute base_len (verify positions) and draft_len (MASK positions)
+            if case_types[bid] == "V":
+                base_len = 1 + len(old_specs[bid] or [])
+            else:  # Cold start
+                base_len = 1
+            draft_len = self.num_masks
+            pad_len = extend_len - base_len - draft_len
+
+            # Base segment (committed + specs): no LoRA
+            if base_len > 0:
+                segment_ids.append(None)
+                segment_lens.append(base_len)
+            # MASK segment: apply LoRA
+            if draft_len > 0:
+                segment_ids.append(req_lora_id)
+                segment_lens.append(draft_len)
+            # Padding segment: no LoRA
+            if pad_len > 0:
+                segment_ids.append(None)
+                segment_lens.append(pad_len)
+
+        forward_batch.lora_segment_ids = segment_ids
+        forward_batch.lora_segment_lens_cpu = segment_lens
+        model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
     def run(
         self,
@@ -299,6 +360,11 @@ class DreamShiftBlockN(DllmAlgorithm):
 
         # ── Pure prefill ──────────────────────────────────────────────
         if not has_any_decode:
+            # Conditional LoRA: prefill is base-only (no LoRA)
+            if self.conditional_lora and forward_batch.lora_ids is not None:
+                forward_batch.lora_segment_ids = [None] * batch_size
+                forward_batch.lora_segment_lens_cpu = extend_lens_cpu
+                model_runner.lora_manager.prepare_lora_batch(forward_batch)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             full_logits = out.logits_output.full_logits
 
@@ -398,6 +464,12 @@ class DreamShiftBlockN(DllmAlgorithm):
             _t_phase1_end = time.perf_counter()
 
         # Phase 2: Forward (GPU async — returns before GPU finishes)
+        # Set up conditional LoRA segments: base-only for verify, base+LoRA for MASK
+        if self.conditional_lora and forward_batch.lora_ids is not None:
+            self._setup_conditional_lora(
+                model_runner, forward_batch, extend_lens_cpu,
+                is_prefill, case_types, old_specs,
+            )
         forward_batch.dllm_force_causal = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         forward_batch.dllm_force_causal = False

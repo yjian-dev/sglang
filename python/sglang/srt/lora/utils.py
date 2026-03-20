@@ -193,3 +193,33 @@ def generate_sequence_lengths(
         else:
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
     return seg_lens
+
+
+def has_custom_lora_segments(forward_batch: ForwardBatch) -> bool:
+    """Check if forward_batch has custom per-token LoRA segment routing."""
+    return (
+        getattr(forward_batch, "lora_segment_ids", None) is not None
+        and getattr(forward_batch, "lora_segment_lens_cpu", None) is not None
+    )
+
+
+def get_lora_segment_ids(forward_batch: ForwardBatch) -> list[Optional[str]]:
+    """Get LoRA IDs: custom segments if set, otherwise per-request lora_ids."""
+    seg_ids = getattr(forward_batch, "lora_segment_ids", None)
+    if seg_ids is None:
+        return forward_batch.lora_ids
+    return seg_ids
+
+
+def generate_lora_segment_lengths(
+    forward_batch: ForwardBatch, device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """Get segment lengths: custom if set, otherwise per-request sequence lengths."""
+    seg_lens_cpu = getattr(forward_batch, "lora_segment_lens_cpu", None)
+    if seg_lens_cpu is None:
+        return generate_sequence_lengths(forward_batch, device=device)
+
+    device = torch.get_default_device() if device is None else device
+    with torch.device(device):
+        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32)
+    return seg_lens

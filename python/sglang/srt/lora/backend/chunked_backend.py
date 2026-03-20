@@ -5,7 +5,7 @@ from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
-from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
+from sglang.srt.lora.utils import LoRABatchInfo, generate_lora_segment_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 
@@ -283,7 +283,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         """
         with torch.device("cpu"):
             seq_weight_indices = torch.tensor(seq_weight_indices, dtype=torch.int32)
-            seg_lens_cpu = generate_sequence_lengths(forward_batch)
+            seg_lens_cpu = generate_lora_segment_lengths(forward_batch)
 
             row_weight_indices = torch.repeat_interleave(
                 seq_weight_indices, seg_lens_cpu

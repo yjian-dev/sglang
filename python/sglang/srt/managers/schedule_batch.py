@@ -2156,6 +2156,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = num_tokens
         self.extend_logprob_start_lens = None
         self.output_ids = None
+        self.lora_ids = [req.lora_id for req in self.reqs]
 
         # 5. Write KV slots via batched scatter
         # Vectorized for pure-decode batches (all extend_lens == block_size)
