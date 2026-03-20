@@ -1,0 +1,10 @@
+# LLaDA2.1-mini - Quality Mode with scheduled transfer
+block_size: 32
+steps: 32
+threshold: 0.7
+edit_threshold: 0.5
+max_post_edit_steps: 16
+temperature: 1.0
+top_k: 50
+top_p: 0.95
+penalty_lambda: 0

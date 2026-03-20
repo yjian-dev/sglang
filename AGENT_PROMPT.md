@@ -1,11 +1,11 @@
-# Agent Prompt — Full Benchmark Suite (DLLM N=3 vs Qwen3-8B)
+# Agent Prompt — LLaDA2.1-mini Evaluation
 
 ## Role
-Run benchmarks for both models. After each benchmark: check truncation/extraction rates, fix issues if found, record results in PLAN.md.
+You are a benchmark evaluation agent. Your primary goal is to make LLaDA2.1-mini match its claimed scores on IFEval (83.18% prompt-strict), then run the full benchmark suite on all remaining benchmarks in order of difficulty.
 
 ## Models
-- **DLLM N=3** (already running): ports 30000-30007
-- **Qwen3-8B**: launch on ports 30010-30017 when needed
+- **LLaDA2.1-mini**: `inclusionAI/LLaDA2.1-mini` (on HF, cached at `/data/yjian/hf_cache`)
+- Servers: 8×TP=1 on ports 30000-30007 (launch fresh each session)
 
 ## Environment
 ```bash
@@ -15,146 +15,121 @@ export CUDA_HOME=/usr/local/cuda-12.9
 export HF_HOME=/data/yjian/hf_cache
 export HUGGINGFACE_HUB_CACHE=/data/yjian/hf_cache/hub
 export FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache
-# HF_TOKEN: needed only for GPQA. Get from user if needed or use env var.
+export HF_TOKEN=<your_hf_token>
 ```
 
-## Launch Qwen3-8B (ports 30010-30017)
+## Phase 0: Match Claimed IFEval Score (PREREQUISITE)
+
+**Target: 83.18% prompt-strict** (LLaDA2.1 paper, Q Mode)
+
+### Current Status
+- bl=32, greedy → 62.7% (repetition/corruption bug in sglang)
+- bl=4, threshold=0.95 → 68.2%
+- bl=32, scheduled transfer (our fix) → ~80%+ (estimated, needs validation)
+
+### Root Cause of Repetition
+sglang's JointThreshold was missing **scheduled transfer** (`num_to_transfer` per step).
+Official HF `generate()` distributes `block_length` tokens across `steps` steps (1 token/step for bl=32/steps=32).
+Our fix: `_get_num_transfer_tokens(block_size, steps)` now in `joint_threshold.py`.
+
+### Steps to Match Claimed Score
+1. **Search for correct params**: Web search "LLaDA2.1-mini sglang JointThreshold IFEval parameters" and check:
+   - https://huggingface.co/inclusionAI/LLaDA2.1-mini (model card)
+   - https://github.com/sgl-project/sglang (issues/PRs about LLaDA2.1)
+   - arxiv paper: https://arxiv.org/abs/2602.08676
+2. **Key config file**: `llada21_quality.yaml` (currently: block_size=32, steps=32, threshold=0.7, edit_threshold=0.5)
+3. **Test IFEval with 20 problems first**, check for repetition in outputs
+4. If repetition still occurs, try:
+   a. Increase `steps` (try 16, 8 instead of 32 per block_size)
+   b. Adjust `threshold` (0.5, 0.6, 0.7)
+   c. Check if `temperature=0.0` (greedy) vs `temperature=1.0` matters
+5. **Only run full 541 IFEval once repetition < 5% of responses**
+
+### Launch Command
 ```bash
+MODEL_PATH=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('inclusionAI/LLaDA2.1-mini'))")
 for i in $(seq 0 7); do
   CUDA_VISIBLE_DEVICES=$i FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache nohup python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-8B --trust-remote-code --tp-size 1 \
-    --mem-fraction-static 0.85 --max-running-requests 64 \
-    --attention-backend flashinfer --dtype bfloat16 \
-    --port $((30010+i)) --chunked-prefill-size 4096 --watchdog-timeout 1800 \
-    > /tmp/sglang_qwen_gpu${i}.log 2>&1 &
+    --model-path inclusionAI/LLaDA2.1-mini \
+    --dllm-algorithm JointThreshold \
+    --dllm-algorithm-config llada21_quality.yaml \
+    --tp-size 1 --trust-remote-code \
+    --mem-fraction-static 0.8 --max-running-requests 1 \
+    --attention-backend flashinfer \
+    --port $((30000+i)) --watchdog-timeout 1800 \
+    > /tmp/sglang_llada21_gpu${i}.log 2>&1 &
 done
+# Wait for all 8
 for i in $(seq 0 7); do
   for j in $(seq 1 60); do
-    curl -sf http://localhost:$((30010+i))/health > /dev/null 2>&1 && echo "GPU $i ready" && break; sleep 10
+    curl -sf http://localhost:$((30000+i))/health > /dev/null 2>&1 && break; sleep 10
   done
 done
 ```
 
----
-
-## DLLM N=3 — 6 Benchmarks (ports 30000-30007)
-
-Run in order (fast first):
-
+### Quick Repetition Check
+Before running full IFEval, test 5 examples and check output quality:
 ```bash
-DLLM="30000 30001 30002 30003 30004 30005 30006 30007"
+python scripts/eval_ifeval.py --ports 30000 --num-problems 5 --max-tokens 16384 --max-workers 1
+cat output_ifeval/ifeval_details.json | python3 -c "
+import json, sys
+for d in json.load(sys.stdin)[:5]:
+    print('PASS:', d['strict_pass'])
+    print('OUT:', d['prediction_stripped'][:200])
+    print()
+"
 ```
-
-### 1. ARC-C (1172, ~5 min)
-```bash
-python scripts/eval_arc_c.py --ports $DLLM
-```
-
-### 2. GPQA main (448, ~10 min) — needs HF_TOKEN
-```bash
-HF_TOKEN=<token> python scripts/eval_gpqa.py --subset main --ports $DLLM
-```
-
-### 3. MMLU-Pro (full ~12k, ~5-7 hrs)
-```bash
-python scripts/eval_mmlu_pro.py --ports $DLLM
-```
-
-### 4. MMLU (full ~14k, ~6-8 hrs)
-```bash
-python scripts/eval_mmlu.py --ports $DLLM
-```
-
-### 5. TriviaQA (full ~11k, ~2-3 hrs)
-```bash
-python scripts/eval_triviaqa.py --ports $DLLM
-```
-
-### 6. CMMLU (full ~11.5k, ~5-7 hrs)
-```bash
-python scripts/eval_cmmlu.py --ports $DLLM
-```
+If output contains repetition like "of of of of" or "the the the", params need adjustment.
 
 ---
 
-## Qwen3-8B — 16 Benchmarks (ports 30010-30017)
+## Phase 1: Benchmarks (Easy → Hard), run AFTER IFEval matches claimed score
 
-**Launch Qwen3-8B first** (see above). Then run:
+Run in this order (quick first, slow last). Use 8 servers ports 30000-30007, max_tokens=32768.
 
+### Tier 1: Very Fast (< 10 min each)
 ```bash
-QWEN="30010 30011 30012 30013 30014 30015 30016 30017"
+PORTS="30000 30001 30002 30003 30004 30005 30006 30007"
+python scripts/eval_arc_c.py --ports $PORTS
+python scripts/eval_gsm8k.py --ports $PORTS
+python scripts/eval_ifeval.py --ports $PORTS --max-tokens 16384 --max-workers 8
+python scripts/eval_aime.py --year 2025 --ports $PORTS
+python scripts/eval_aime.py --year 2024 --ports $PORTS
+python scripts/eval_math500.py --ports $PORTS
 ```
 
-Fast benchmarks first:
-
+### Tier 2: Medium (10-30 min each)
 ```bash
-# ARC-C
-python scripts/eval_arc_c.py --ports $QWEN
+python scripts/eval_humaneval.py --ports $PORTS
+python scripts/eval_mbpp.py --ports $PORTS
+python scripts/eval_mathbench.py --ports $PORTS  # circular, ~30 min
+HF_TOKEN=$HF_TOKEN python scripts/eval_gpqa.py --subset diamond --ports $PORTS
+HF_TOKEN=$HF_TOKEN python scripts/eval_gpqa.py --subset main --ports $PORTS
+```
 
-# GPQA Diamond (198)
-HF_TOKEN=<token> python scripts/eval_gpqa.py --subset diamond --ports $QWEN
-
-# GPQA main (448)
-HF_TOKEN=<token> python scripts/eval_gpqa.py --subset main --ports $QWEN
-
-# IFEval
-python scripts/eval_ifeval.py --ports $QWEN
-
-# GSM8K
-python scripts/eval_gsm8k.py --ports $QWEN
-
-# Math500
-python scripts/eval_math500.py --ports $QWEN
-
-# AIME-2024
-python scripts/eval_aime.py --year 2024 --ports $QWEN
-
-# AIME-2025
-python scripts/eval_aime.py --year 2025 --ports $QWEN
-
-# HumanEval
-python scripts/eval_humaneval.py --ports $QWEN
-
-# MBPP
-python scripts/eval_mbpp.py --ports $QWEN
-
-# LCB-v6
-python scripts/eval_lcb.py --version 6 --max-workers 16 --ports $QWEN
-
-# MathBench (circular, ~60 min)
-python scripts/eval_mathbench.py --ports $QWEN
-
-# TriviaQA
-python scripts/eval_triviaqa.py --ports $QWEN
-
-# MMLU-Pro
-python scripts/eval_mmlu_pro.py --ports $QWEN
-
-# MMLU
-python scripts/eval_mmlu.py --ports $QWEN
-
-# CMMLU
-python scripts/eval_cmmlu.py --ports $QWEN
+### Tier 3: Slow (> 1 hour each)
+```bash
+python scripts/eval_triviaqa.py --ports $PORTS
+python scripts/eval_mmlu.py --ports $PORTS
+python scripts/eval_mmlu_pro.py --ports $PORTS
+python scripts/eval_cmmlu.py --ports $PORTS
+python scripts/eval_lcb.py --version 6 --max-workers 8 --ports $PORTS
 ```
 
 ---
 
-## Quality Check After EACH Benchmark
-1. Check truncation rate (`finish_reason='length'`). If >15% at 32k → note in results, don't rerun
-2. Check extraction failure rate (`pred='?'`). **If >5% → fix script and rerun**
-3. Print 3 wrong examples — confirm it's model error not script bug
-4. Update PLAN.md results table
+## Quality Check After Each Benchmark
+1. Check truncation rate (should be < 15% at 32k tokens)
+2. Check extraction failures (should be < 5%)
+3. **Check for repetition in wrong answers** — sample 3 failed responses
+4. If repetition > 10%: go back to Phase 0, adjust params
 
-## OC Alignment Reference
-`/data/cxu/dllm-distillation/evaluation/opencompass/opencompass/configs/datasets/`
-- TriviaQA prompt: "The answer is " prefix
-- GPQA prompt: "ANSWER: $LETTER" (implemented ✓)
-- MMLU/MMLU-Pro/CMMLU: standard multiple choice
-- MathBench: circular perf_4 (implemented ✓)
-- LCB: OC run_test evaluator (implemented ✓)
+## Config Files
+- `llada21_quality.yaml` — Quality Mode (current best params)
+- `llada21_b4_t95.yaml` — Speed variant (bl=4)
 
 ## Notes
-- All scripts default to full dataset (--num-problems 0)
-- All scripts default to --max-tokens 32768
-- DLLM servers must NOT be killed (running on 30000-30007)
-- If a server crashes, restart with: `CUDA_VISIBLE_DEVICES=$i FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache python -m sglang.launch_server ... --watchdog-timeout 1800`
+- max-running-requests=1 is required for LLaDA2.1-mini (MoE model, high memory per request)
+- Model is ~15GB, all 8 GPUs should fit
+- Do NOT download to home folder (disk quota exceeded) — always use HF_HOME=/data/yjian/hf_cache
+- IFEval: use --max-workers 8 (not 541) to avoid OOM with bl=32

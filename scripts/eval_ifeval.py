@@ -48,7 +48,7 @@ def run_one(args):
     i, prompt, ref, port, max_tokens, timeout, temperature, top_p, top_k = args
     try:
         r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={
-            "model": "sdar",
+            "model": "default",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
