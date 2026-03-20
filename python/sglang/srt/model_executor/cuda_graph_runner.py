@@ -887,6 +887,14 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+        # Set extend fields for DLLM_EXTEND mode (needed by LoRA segment length computation)
+        if self.capture_forward_mode.is_dllm_extend():
+            _tpb = self.num_tokens_per_bs
+            forward_batch.extend_seq_lens = torch.full(
+                (bs,), _tpb, dtype=torch.int32, device=input_ids.device
+            )
+            forward_batch.extend_seq_lens_cpu = [_tpb] * bs
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:

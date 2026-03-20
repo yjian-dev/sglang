@@ -235,9 +235,26 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             )
         else:
             batch_info = self.cuda_graph_batch_info
-            batch_info.bs = forward_batch.batch_size
-            batch_info.num_segments = num_segments
-            batch_info.max_len = chunk_size
+            # Safety: if graph batch_info is too small (e.g. prefill after graph capture),
+            # fall back to creating a fresh one.
+            if (batch_info.permutation.shape[0] < len(permutation)
+                    or batch_info.weight_indices.shape[0] < num_segments):
+                batch_info = LoRABatchInfo(
+                    bs=forward_batch.batch_size,
+                    num_segments=num_segments,
+                    max_len=chunk_size,
+                    use_cuda_graph=False,
+                    seg_indptr=torch.empty((num_segments + 1,), dtype=torch.int32, device=self.device),
+                    weight_indices=torch.empty((num_segments,), dtype=torch.int32, device=self.device),
+                    lora_ranks=torch.empty((self.max_loras_per_batch,), dtype=torch.int32, device=self.device),
+                    scalings=torch.empty((self.max_loras_per_batch,), dtype=torch.float, device=self.device),
+                    permutation=torch.empty((len(permutation),), dtype=torch.int32, device=self.device),
+                    seg_lens=None,
+                )
+            else:
+                batch_info.bs = forward_batch.batch_size
+                batch_info.num_segments = num_segments
+                batch_info.max_len = chunk_size
 
         # Copy to device asynchronously
         batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
