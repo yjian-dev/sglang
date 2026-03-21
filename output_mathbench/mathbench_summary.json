@@ -1,0 +1,92 @@
+{
+  "overall_acc": 84.17363170665948,
+  "correct": 3122,
+  "total": 3709,
+  "splits": {
+    "college/single_choice_cn": {
+      "acc": 57.99999999999999,
+      "correct": 87,
+      "total": 150
+    },
+    "college/single_choice_en": {
+      "acc": 75.33333333333333,
+      "correct": 113,
+      "total": 150
+    },
+    "high/single_choice_cn": {
+      "acc": 70.66666666666667,
+      "correct": 106,
+      "total": 150
+    },
+    "high/single_choice_en": {
+      "acc": 76.0,
+      "correct": 114,
+      "total": 150
+    },
+    "middle/single_choice_cn": {
+      "acc": 92.66666666666666,
+      "correct": 139,
+      "total": 150
+    },
+    "middle/single_choice_en": {
+      "acc": 85.33333333333334,
+      "correct": 128,
+      "total": 150
+    },
+    "college_knowledge/single_choice_cn": {
+      "acc": 84.49367088607595,
+      "correct": 267,
+      "total": 316
+    },
+    "college_knowledge/single_choice_en": {
+      "acc": 86.39240506329115,
+      "correct": 273,
+      "total": 316
+    },
+    "high_knowledge/single_choice_cn": {
+      "acc": 84.46808510638299,
+      "correct": 397,
+      "total": 470
+    },
+    "high_knowledge/single_choice_en": {
+      "acc": 85.05338078291815,
+      "correct": 239,
+      "total": 281
+    },
+    "middle_knowledge/single_choice_cn": {
+      "acc": 91.01796407185628,
+      "correct": 304,
+      "total": 334
+    },
+    "middle_knowledge/single_choice_en": {
+      "acc": 88.57142857142857,
+      "correct": 155,
+      "total": 175
+    },
+    "primary_knowledge/single_choice_cn": {
+      "acc": 94.23076923076923,
+      "correct": 196,
+      "total": 208
+    },
+    "primary_knowledge/single_choice_en": {
+      "acc": 92.66055045871559,
+      "correct": 101,
+      "total": 109
+    },
+    "primary/cloze_cn": {
+      "acc": 87.33333333333333,
+      "correct": 131,
+      "total": 150
+    },
+    "primary/cloze_en": {
+      "acc": 83.33333333333334,
+      "correct": 125,
+      "total": 150
+    },
+    "arithmetic/cloze_en": {
+      "acc": 82.33333333333334,
+      "correct": 247,
+      "total": 300
+    }
+  }
+}

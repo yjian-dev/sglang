@@ -1,7 +1,7 @@
 # Plan — b3 Checkpoint Benchmark Evaluation (N=4 Sampling)
 
 ## Status
-Not started
+COMPLETE — All 13 benchmarks finished
 
 ## Model Under Test
 **b3 checkpoint (N=4 sampling)**
@@ -31,19 +31,19 @@ Not started
 ## Results Table (b3, N=4 Sampling)
 | Benchmark | b3 N=4 | b2 N=3 | Delta | Notes |
 |-----------|--------|--------|-------|-------|
-| ARC-C (1172) | | 95.3% | | |
-| IFEval (541) | | 87.4% | | |
-| GSM8K (1319) | | 96% | | |
-| Math500 (500) | | 95.2% | | |
-| AIME-2025 (30) | | 61.0% | | |
-| HumanEval (164) | | 93.9% | | |
-| MBPP (257) | | 91.8% | | |
-| LCB-v6 (175) | | 45.1% | | OC eval |
-| GPQA main (448) | | 54.5% | | |
-| MMLU-Pro (~12k) | | 65.5% | | |
-| MMLU (~14k) | | 82.4% | | |
-| TriviaQA (~11k) | | 63.2% | | |
-| CMMLU (~11.5k) | | 76.7% | | |
+| ARC-C (1172) | 95.0% | 95.3% | -0.3 | OK |
+| IFEval (541) | 82.3% | 87.4% | -5.1 | prompt-strict; loose=86.0% |
+| GSM8K (1319) | 94.1% | 96% | -1.9 | 32k max_tokens |
+| Math500 (500) | 96.4% | 95.2% | +1.2 | 32k max_tokens (was 87.6% at 8k) |
+| AIME-2025 (30) | 56.7% | 61.0% | -4.3 | 17/30, small sample |
+| HumanEval (164) | 94.5% | 93.9% | +0.6 | 32k max_tokens (was 76.8% at 4k) |
+| MBPP (257) | 92.6% | 91.8% | +0.8 | 32k max_tokens (was 4.7% at 512!) |
+| LCB-v6 (175) | 43.4% | 45.1% | -1.7 | OC eval |
+| GPQA main (448) | 48.0% | 54.5% | -6.5 | **ANOMALY** — real drop, 32k default |
+| MMLU-Pro (~12k) | 62.1% | 65.5% | -3.4 | |
+| MMLU (~14k) | 77.6% | 82.4% | -4.8 | 32k default |
+| TriviaQA (17944) | 57.8% | 63.2% | -5.4 | 32k rerun; ref used ~11k subset |
+| CMMLU (~11.5k) | 74.5% | 76.7% | -2.2 | OK |
 
 ## Launch Command (8×TP=1 N=4 Sampling)
 ```bash
@@ -152,4 +152,34 @@ export HF_TOKEN=<your_hf_token>
 ```
 
 ## Progress Log
-<!-- Agent updates this after each benchmark -->
+
+### Iteration 1 (2026-03-21)
+- [x] Verified all 8 servers healthy (b3 N=4 config correct)
+- [x] Sanity check: model produces coherent output
+- [x] Tier 1 benchmarks complete (ARC-C, IFEval, GSM8K, Math500, AIME, HumanEval, MBPP)
+- [x] Tier 2 benchmarks complete (LCB-v6, GPQA main)
+- [x] MMLU-Pro complete
+- [x] MMLU — 77.6% (-4.8pp)
+- [x] TriviaQA — 57.8% at 32k (-5.4pp); was 29.5% at 4k default
+- [x] CMMLU — 74.5% (-2.2pp)
+
+**Key findings:**
+1. **max_tokens truncation bug**: HumanEval (4k), MBPP (512), Math500 (8k), TriviaQA (4k) defaults too low for thinking model. Re-ran all with 32k → scores normalized.
+2. **GPQA anomaly**: -6.5pp drop is real (already 32k max_tokens). Likely N=4 OOD effect on hard reasoning.
+3. **IFEval**: -5.1pp on prompt-strict but only -1.4pp on loose. Borderline.
+4. **MMLU**: -4.8pp real drop. MMLU-Pro -3.4pp.
+5. **TriviaQA**: -5.4pp after fixing max_tokens. Different dataset size (17944 vs ~11k ref).
+6. **Code benchmarks improved**: HumanEval +0.6pp, MBPP +0.8pp, Math500 +1.2pp (all with 32k).
+
+### Summary
+- **Improved (>+0.5pp)**: Math500 (+1.2), MBPP (+0.8), HumanEval (+0.6)
+- **Within ±3pp**: ARC-C (-0.3), GSM8K (-1.9), LCB-v6 (-1.7), CMMLU (-2.2)
+- **Moderate drop (3-5pp)**: MMLU-Pro (-3.4), AIME (-4.3), MMLU (-4.8), IFEval (-5.1)
+- **Notable drop (>5pp)**: TriviaQA (-5.4), GPQA (-6.5)
+- **Average delta across all 13 benchmarks**: ~-2.5pp
+
+The b3 N=4 checkpoint shows modest overall degradation vs b2 N=3, concentrated in knowledge-heavy benchmarks (GPQA, MMLU, TriviaQA). Code/math benchmarks are equal or slightly improved. The N=4 OOD gap (trained bl=3, infer bl=7) likely explains the knowledge benchmark drops.
+
+### Next Steps
+- All benchmarks complete. No further action needed.
+- Consider re-running GPQA/MMLU with N=3 config on b3 checkpoint to isolate OOD effect vs model difference.

@@ -223,7 +223,7 @@ class DreamShiftBlockN(DllmAlgorithm):
             "phase4_trim_assemble": 0.0,
             "timing_count": 0,
         }
-        self._timing_enabled = False  # Set True for profiling (adds GPU sync overhead!)
+        self._timing_enabled = False  # Set True for profiling (adds GPU sync overhead!) (adds GPU sync overhead!)
         logger.info(
             f"[DreamShiftBlockN] gen_block_size={self.gen_block_size}, "
             f"block_size={self.block_size}, num_masks={self.num_masks}, "
