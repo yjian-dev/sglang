@@ -1,104 +1,155 @@
-# Plan — LLaDA2.1-mini Benchmark Evaluation
+# Plan — b3 Checkpoint Benchmark Evaluation (N=4 Sampling)
 
 ## Status
-Phase 0 NEARLY COMPLETE — 82.07% vs 83.18% target (1.1% gap)
-Phase 1 READY TO START — servers running with bl=4 config
+Not started
 
-## Model
-**LLaDA2.1-mini** (`inclusionAI/LLaDA2.1-mini`)
-- MoE architecture, ~8B params
-- Servers: 8×TP=1, ports 30000-30007, max-running-requests=1
-- Config: `llada21_quality.yaml` (bl=4, steps=4, threshold=0.95, edit_threshold=0.9)
+## Model Under Test
+**b3 checkpoint (N=4 sampling)**
+- Path: `/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b3-causal-from-b2amc_fixed2_cont_epoch2_lr1e-5_backup8000`
+- Trained block_size=3, use_regular_causal=True
+- Running with: DreamShiftBlockN **N=4** (block_size=7, gen_block_size=4)
+- Config: `dreamshift_blockN4_config.yaml`
+- Servers: 8×TP=1, ports 30000-30007
 
-## Claimed Scores (Paper)
-| Benchmark | Q Mode | S Mode |
-|-----------|--------|--------|
-| IFEval (prompt-strict) | **83.18%** | 81.33% |
-| GSM8K | 86.55% | 85.88% |
-| Math500 | — | — |
-| HumanEval+ | 82.93% | 80.49% |
-| MBPP+ | 74.07% | 73.28% |
-| LCB-v6 | 30.40% | 28.85% |
-| GPQA-diamond | 53.28% | 48.36% |
+## N=3 Reference Results (b2-cont checkpoint)
+| Benchmark | N=3 (b2-cont) | Notes |
+|-----------|--------------|-------|
+| ARC-C (1172) | 95.3% | |
+| GPQA main (448) | 54.5% | |
+| MMLU (~14k) | 82.4% | |
+| MMLU-Pro (~12k) | 65.5% | |
+| TriviaQA (~11k) | 63.2% | |
+| GSM8K (1319) | 96% | |
+| Math500 (500) | 95.2% | |
+| AIME-2025 (30) | 61.0% | |
+| IFEval (541) | 87.4% | |
+| HumanEval (164) | 93.9% | |
+| MBPP (257) | 91.8% | |
+| LCB-v6 (175) | 45.1% | OC evaluator |
+| CMMLU (~11.5k) | 76.7% | |
 
-## Phase 0: Match IFEval Claimed Score ← NEARLY DONE
+## Results Table (b3, N=4 Sampling)
+| Benchmark | b3 N=4 | b2 N=3 | Delta | Notes |
+|-----------|--------|--------|-------|-------|
+| ARC-C (1172) | | 95.3% | | |
+| IFEval (541) | | 87.4% | | |
+| GSM8K (1319) | | 96% | | |
+| Math500 (500) | | 95.2% | | |
+| AIME-2025 (30) | | 61.0% | | |
+| HumanEval (164) | | 93.9% | | |
+| MBPP (257) | | 91.8% | | |
+| LCB-v6 (175) | | 45.1% | | OC eval |
+| GPQA main (448) | | 54.5% | | |
+| MMLU-Pro (~12k) | | 65.5% | | |
+| MMLU (~14k) | | 82.4% | | |
+| TriviaQA (~11k) | | 63.2% | | |
+| CMMLU (~11.5k) | | 76.7% | | |
 
-### Progress
-- [x] bl=32, greedy (broken): 62.7% — repetition bug
-- [x] bl=4, threshold=0.95 (old code): 68.2%
-- [x] bl=32 + scheduled transfer fix, threshold=0.7: 62.48% — still corrupted
-- [x] bl=32 + scheduled transfer fix, threshold=0.95: ~40% — worse
-- [x] **bl=4, threshold=0.95, edit_threshold=0.9: 82.07%** ← current best
-- [ ] Optional: try to close remaining 1.1% gap
+## Launch Command (8×TP=1 N=4 Sampling)
+```bash
+MODEL=/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b3-causal-from-b2amc_fixed2_cont_epoch2_lr1e-5_backup8000
 
-### Key Finding: bl=32 Denoising Quality Bug
-sglang's JointThreshold with bl=32 produces corrupted/repetitive output:
-- 32 denoising iterations per block compound numerical errors
-- bl=4 (4 iterations) avoids this compounding
-- Root cause likely in ragged attention KV rewrite during iteration loop
+source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
+export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
+export CUDA_HOME=/usr/local/cuda-12.9
+export HF_HOME=/data/yjian/hf_cache
+export FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache
 
-### Config (sglang vs official HF defaults)
-| Parameter | Old sglang | Official | Final sglang |
-|-----------|-----------|----------|-------------|
-| block_size | 32 | 32 | **4** |
-| steps | 32 | 32 | **4** |
-| threshold | 0.7 | 0.95 | **0.95** |
-| edit_threshold | 0.5 | 0.9 | **0.9** |
-| temperature | 1.0 | 0.0 | **0.0** |
+for i in $(seq 0 7); do
+  CUDA_VISIBLE_DEVICES=$i FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache nohup python -m sglang.launch_server \
+    --model-path $MODEL \
+    --trust-remote-code --tp-size 1 \
+    --mem-fraction-static 0.85 --max-running-requests 32 \
+    --attention-backend flashinfer --dllm-algorithm DreamShiftBlockN \
+    --dllm-algorithm-config dreamshift_blockN4_config.yaml \
+    --dtype bfloat16 --port $((30000+i)) --chunked-prefill-size 4096 \
+    --watchdog-timeout 1800 \
+    > /tmp/sglang_b3n4_gpu${i}.log 2>&1 &
+done
+# Wait for all 8
+for i in $(seq 0 7); do
+  for j in $(seq 1 60); do
+    curl -sf http://localhost:$((30000+i))/health > /dev/null 2>&1 && echo "GPU $i ready" && break; sleep 10
+  done
+done
+```
 
-## Phase 1: Benchmark Suite ← NEXT
+## Benchmark Execution Order (easy → hard)
 
-| Benchmark | Status | Score | Notes |
-|-----------|--------|-------|-------|
-| **IFEval** | ✅ Done | **82.07%** | target 83.18% |
-| ARC-C | ⬜ Next | | fast |
-| GSM8K | ⬜ Next | | fast, target 86.55% |
-| Math500 | ⬜ Next | | fast |
-| AIME-2024 | ⬜ | | fast |
-| AIME-2025 | ⬜ | | fast |
-| HumanEval+ | ⬜ | | fast, target 82.93% |
-| MBPP+ | ⬜ | | fast, target 74.07% |
-| MathBench | ⬜ | | medium (~30 min) |
-| GPQA-diamond | ⬜ | | medium, target 53.28% |
-| GPQA-main | ⬜ | | medium |
-| TriviaQA | ⬜ | | slow |
-| MMLU | ⬜ | | slow |
-| MMLU-Pro | ⬜ | | slow |
-| CMMLU | ⬜ | | slow |
-| LCB-v6 | ⬜ | | slow, target 30.40% |
+### Tier 1: Fast (< 10 min each) — run first
+```bash
+PORTS="30000 30001 30002 30003 30004 30005 30006 30007"
 
-## Next Steps (for next iteration)
-1. Run Tier 1 fast benchmarks: ARC-C, GSM8K, Math500, AIME-2024, AIME-2025
-2. Run Tier 2: HumanEval+, MBPP+, MathBench, GPQA
-3. Run Tier 3: TriviaQA, MMLU, MMLU-Pro, CMMLU, LCB
+# ARC-C
+python scripts/eval_arc_c.py --ports $PORTS --output-dir bench_results/b3n4
+
+# IFEval
+python scripts/eval_ifeval.py --ports $PORTS --max-tokens 32768 --max-workers 8 --output-dir bench_results/b3n4
+
+# GSM8K
+python scripts/eval_gsm8k.py --ports $PORTS --output-dir bench_results/b3n4
+
+# Math500
+python scripts/eval_math500.py --ports $PORTS --output-dir bench_results/b3n4
+
+# AIME-2025
+python scripts/eval_aime.py --year 2025 --ports $PORTS --output-dir bench_results/b3n4
+
+# HumanEval
+python scripts/eval_humaneval.py --ports $PORTS --output-dir bench_results/b3n4
+
+# MBPP
+python scripts/eval_mbpp.py --ports $PORTS --output-dir bench_results/b3n4
+```
+
+### Tier 2: Medium (10-60 min each)
+```bash
+# LCB-v6 (OC evaluator, accurate)
+python scripts/eval_lcb.py --version 6 --max-workers 16 --ports $PORTS --output-dir bench_results/b3n4
+
+# GPQA main (needs HF token)
+HF_TOKEN=<your_hf_token> python scripts/eval_gpqa.py --subset main --ports $PORTS --output-dir bench_results/b3n4
+```
+
+### Tier 3: Slow (1-8 hrs each)
+```bash
+# MMLU-Pro (full ~12k)
+python scripts/eval_mmlu_pro.py --ports $PORTS --output-dir bench_results/b3n4
+
+# MMLU (full ~14k)
+python scripts/eval_mmlu.py --ports $PORTS --output-dir bench_results/b3n4
+
+# TriviaQA (full ~11k)
+python scripts/eval_triviaqa.py --ports $PORTS --output-dir bench_results/b3n4
+
+# CMMLU (full ~11.5k)
+python scripts/eval_cmmlu.py --ports $PORTS --output-dir bench_results/b3n4
+```
+
+## Quality Check After Each Benchmark
+1. Check truncation rate (finish_reason='length'). At 32k should be < 10%.
+2. Check extraction failures (pred='?'). Should be < 5%.
+3. **Compare vs N=3 reference**:
+   - If b3 N=4 is within ±3% of b3 N=3: normal variation
+   - If b3 N=4 is > 5% LOWER than b3 N=3: investigate (wrong checkpoint? wrong config?)
+   - If b3 N=4 consistently HIGHER: good news, better checkpoint
+
+## Anomaly Detection
+If any benchmark score is > 10pp lower than N=3 reference, immediately:
+1. Test a few sample prompts manually for quality
+2. Verify the correct model path is loaded (check server log)
+3. Verify dreamshift_blockN4_config.yaml is correct (block_size=7, gen_block_size=4)
+4. Check if server crashed and restarted
 
 ## Environment
 ```bash
 source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
+export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
+export CUDA_HOME=/usr/local/cuda-12.9
 export HF_HOME=/data/yjian/hf_cache
-export HUGGINGFACE_HUB_CACHE=/data/yjian/hf_cache/hub
 export FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache
-```
-
-## Server Launch (bl=4)
-```bash
-for i in $(seq 0 7); do
-  CUDA_VISIBLE_DEVICES=$i FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache nohup python -m sglang.launch_server \
-    --model-path inclusionAI/LLaDA2.1-mini \
-    --dllm-algorithm JointThreshold \
-    --dllm-algorithm-config llada21_quality.yaml \
-    --tp-size 1 --trust-remote-code \
-    --mem-fraction-static 0.8 --max-running-requests 1 \
-    --attention-backend flashinfer \
-    --port $((30000+i)) --watchdog-timeout 1800 \
-    > /tmp/sglang_llada21_gpu${i}.log 2>&1 &
-done
+export HF_TOKEN=<your_hf_token>
 ```
 
 ## Progress Log
-- Fixed JointThreshold repetition bug (missing scheduled transfer)
-- Discovered bl=32 has fundamental quality issue in sglang (error compounding in denoising loop)
-- Updated thresholds to match official HF defaults (threshold=0.95, edit_threshold=0.9)
-- **bl=4, threshold=0.95, edit_threshold=0.9: 82.07% IFEval** (target: 83.18%)
-- Only 2/97 failures have severe repetition (2.1%)
-- Throughput: 369.6 tok/s on 8 GPUs
+<!-- Agent updates this after each benchmark -->
