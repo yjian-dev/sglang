@@ -25,7 +25,12 @@ from human_eval.evaluation import evaluate_functional_correctness
 def strip_thinking(text):
     if not text:
         return ""
-    return re.sub(r'^.*</think>\s*', '', text, count=1, flags=re.DOTALL)
+    # Strip everything up to and including </think>
+    result = re.sub(r'^.*</think>\s*', '', text, count=1, flags=re.DOTALL)
+    # If <think> present but no </think> (truncated), strip from <think> to end
+    if '<think>' in result and '</think>' not in result:
+        result = re.sub(r'<think>.*', '', result, count=1, flags=re.DOTALL)
+    return result
 
 
 def postprocess(text):
