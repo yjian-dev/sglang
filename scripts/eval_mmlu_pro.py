@@ -26,17 +26,21 @@ def strip_thinking(text):
 
 
 def extract_choice(text):
-    """Extract single letter choice (A-J) from model output."""
+    """Extract single letter choice (A-P) from model output."""
     text = strip_thinking(text)
+    # OC primary: ANSWER: X
+    m = re.search(r"(?i)ANSWER\s*:\s*([A-Pa-p])", text)
+    if m:
+        return m.group(1).upper()
     # Look for "answer is (X)" or "answer is X"
-    m = re.search(r"[Aa]nswer is:?\s*\(?([A-Ja-j])\)?", text)
+    m = re.search(r"[Aa]nswer is:?\s*\(?([A-Pa-p])\)?", text)
     if m:
         return m.group(1).upper()
     # Look for boxed answer
-    m = re.search(r"\\boxed\{([A-Ja-j])\}", text)
+    m = re.search(r"\\boxed\{([A-Pa-p])\}", text)
     if m:
         return m.group(1).upper()
-    # Last standalone letter
+    # Last standalone letter (limited to J for MMLU-Pro's 10 choices)
     m = re.findall(r'\b([A-Ja-j])\b', text)
     if m:
         return m[-1].upper()
@@ -44,11 +48,11 @@ def extract_choice(text):
 
 
 def format_choices(options):
-    """Format choices as A. xxx  B. xxx  ..."""
-    letters = "ABCDEFGHIJ"
+    """Format choices as A. xxx  B. xxx  ... (OC format, period separator)."""
+    letters = "ABCDEFGHIJKLMNOP"
     lines = []
     for i, opt in enumerate(options):
-        if i < len(letters):
+        if i < len(letters) and opt != "N/A":
             lines.append(f"{letters[i]}. {opt}")
     return "\n".join(lines)
 
@@ -56,8 +60,8 @@ def format_choices(options):
 def run_one(args):
     idx, question, choices_str, gold, port, max_tokens, timeout, temperature, top_p, top_k = args
     prompt = (
-        f"{question}\n\n{choices_str}\n\n"
-        "Think step by step, then give your answer as \"The answer is (X)\"."
+        "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: $LETTER' (without quotes) where LETTER is one of Options(e.g. one of ABCDEFGHIJKLMNOP). Think step by step before answering.\n\n"
+        f"Question:\n\n{question}\n\nOptions:\n\n{choices_str}"
     )
     try:
         r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={

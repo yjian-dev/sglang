@@ -15,6 +15,48 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import load_dataset
 
+from latex2sympy2_extended import NormalizationConfig
+from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
+
+
+def strip_thinking(text):
+    if not text:
+        return ""
+    return re.sub(r'^.*</think>\s*', '', text, count=1, flags=re.DOTALL)
+
+
+def verify_answer(prediction, reference):
+    """Verify prediction against reference using math_verify (OpenCompass-compatible)."""
+    prediction = strip_thinking(prediction)
+
+    ref_with_env = f'${reference}$'
+    gold_parsed = parse(
+        ref_with_env,
+        extraction_mode='first_match',
+        extraction_config=[LatexExtractionConfig(), ExprExtractionConfig()],
+    )
+
+    if len(gold_parsed) == 0:
+        return False
+
+    pred_parsed = parse(
+        prediction,
+        extraction_config=[
+            LatexExtractionConfig(
+                boxed_match_priority=0,
+            ),
+            ExprExtractionConfig(),
+        ],
+    )
+
+    if len(pred_parsed) == 0:
+        return False
+
+    try:
+        return verify(gold_parsed, pred_parsed)
+    except Exception:
+        return False
+
 
 def run_one(args):
     i, q, gold, port, max_tokens, temperature, top_p, top_k, timeout = args
@@ -31,16 +73,9 @@ def run_one(args):
         c = r["choices"][0]["message"]["content"]
         comp = r["usage"]["completion_tokens"]
         finish = r["choices"][0]["finish_reason"]
-        boxed = re.findall(r'\\boxed\{([^}]+)\}', c)
-        if boxed:
-            pred = boxed[-1].replace(",", "").replace("$", "").replace("\\", "").strip()
-        else:
-            after = c.split("</think>")[-1] if "</think>" in c else c
-            nums = re.findall(r'[\d,]+', after)
-            pred = nums[-1].replace(",", "") if nums else "?"
-        return i, pred, gold, comp, finish, None
+        return i, c, gold, comp, finish, None
     except Exception as e:
-        return i, "?", gold, 0, "error", str(e)
+        return i, "", gold, 0, "error", str(e)
 
 
 def main():
@@ -85,11 +120,12 @@ def main():
     elapsed = time.time() - t0
 
     correct = total_tok = errors = length_limited = 0
-    for i, pred, gold, comp, finish, err in sorted(results):
-        correct += (pred == gold)
-        total_tok += comp
+    for i, content, gold, comp, finish, err in sorted(results):
         if err:
             errors += 1
+        else:
+            correct += verify_answer(content, gold)
+        total_tok += comp
         if finish == "length":
             length_limited += 1
 

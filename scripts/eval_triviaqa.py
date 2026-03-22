@@ -25,28 +25,35 @@ def strip_thinking(text):
     return re.sub(r"^.*?</think>\s*", "", text, count=1, flags=re.DOTALL)
 
 
-def normalize_answer(s):
-    """Lower text and remove punctuation, articles and extra whitespace."""
-    s = s.lower()
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    s = re.sub(r"[^a-z0-9\s]", "", s)
-    return " ".join(s.split())
+def general_postprocess(text):
+    """OC-compatible postprocessing: cut at first newline/period/comma, remove punctuation and articles."""
+    # Cut off at first newline, period, or comma
+    truncated = re.split(r'[\n.,]', text, 1)[0]
+    # Remove punctuation
+    no_punct = re.sub(r'[^\w\s]', '', truncated)
+    # Remove articles
+    no_articles = re.sub(r'\b(a|an|the)\b', '', no_punct, flags=re.IGNORECASE)
+    # Collapse whitespace
+    return re.sub(r'\s+', ' ', no_articles).strip()
 
 
-def extract_answer(text):
-    """Extract answer after 'The answer is' (OC-style extraction)."""
-    m = re.search(r"[Tt]he answer is\s+(.+?)(?:[.\n]|$)", text)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
+def extract_and_postprocess(text):
+    """Extract answer matching OC TriviaQAEvaluator logic."""
+    # Take first line (OC: prediction.strip().split('\\n')[0])
+    text = text.strip().split('\n')[0].lower()
+    # Split on known answer prefixes (OC order)
+    text = text.split('answer is')[-1]
+    text = text.split('a:')[-1]
+    text = text.split('answer:')[-1]
+    text = text.strip()
+    return general_postprocess(text)
 
 
-def check_answer(pred, gold_answers):
-    """Check if extracted answer matches any gold answer."""
-    pred_norm = normalize_answer(pred)
+def check_answer(pred_processed, gold_answers):
+    """Check if processed prediction contains any gold answer (OC: cand in pred)."""
     for gold in gold_answers:
-        gold_norm = normalize_answer(gold)
-        if gold_norm == pred_norm or gold_norm in pred_norm:
+        gold_processed = general_postprocess(gold).lower()
+        if gold_processed in pred_processed:
             return True
     return False
 
@@ -65,8 +72,8 @@ def run_one(args):
         }, timeout=timeout).json()
         content = r["choices"][0]["message"]["content"]
         content = strip_thinking(content)
-        # Extract just the answer part after "The answer is"
-        answer = extract_answer(content)
+        # OC-compatible extraction: first line, split on prefixes, postprocess
+        answer = extract_and_postprocess(content)
         comp = r["usage"]["completion_tokens"]
         return idx, answer, gold_answers, comp, None
     except Exception as e:
@@ -77,8 +84,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-problems", type=int, default=0, help="0=full dataset")
     parser.add_argument("--ports", type=int, nargs="+", default=[30000 + i for i in range(8)])
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="4096 enough for thinking models; DLLM can use 256")
+    parser.add_argument("--max-tokens", type=int, default=256,
+                        help="OC uses max_out_len=50; 256 gives room for thinking")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)

@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from datasets import load_dataset
 
-SYSTEM_PROMPT = "You are a mathematics expert. Please reason step by step, and put your final answer within \\boxed{}."
+INSTRUCTION_SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
 
 
 def strip_thinking(text):
@@ -61,8 +61,7 @@ def run_one(args):
     payload = {
         "model": "default",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": problem},
+            {"role": "user", "content": problem + INSTRUCTION_SUFFIX},
         ],
         "max_tokens": max_tokens,
         "temperature": temperature,

@@ -27,6 +27,10 @@ def strip_thinking(text):
 def extract_choice(text):
     """Extract single letter choice (A-D) from model output."""
     text = strip_thinking(text)
+    # OC primary: ANSWER: X
+    m = re.search(r"(?i)ANSWER\s*:\s*([A-Da-d])", text)
+    if m:
+        return m.group(1).upper()
     m = re.search(r"[Aa]nswer is:?\s*\(?([A-Da-d])\)?", text)
     if m:
         return m.group(1).upper()
@@ -57,8 +61,8 @@ def format_choices(choices):
 def run_one(args):
     idx, question, choices_str, gold, port, max_tokens, timeout, temperature, top_p, top_k = args
     prompt = (
-        f"{question}\n\n{choices_str}\n\n"
-        "Think step by step, then give your answer as \"The answer is (X)\"."
+        "Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.\n\n"
+        f"{question}\n\n{choices_str}"
     )
     try:
         r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={
