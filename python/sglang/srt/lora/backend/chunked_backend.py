@@ -43,10 +43,24 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # prepare_lora_batch can be skipped during replay since the graph
         # replays baked-in cuBLAS ops regardless of batch_info.
         self.cublas_graph_captured = False
+        # Conditional LoRA mask: per-token mask (1=apply LoRA, 0=skip).
+        # Shape: (max_tokens,). GPU tensor so contents update between graph replays.
+        # Applied after shrink mm to zero out verify positions' LoRA contribution.
+        self.lora_mask: torch.Tensor = None
 
     def _use_cublas(self) -> bool:
         """Check if cuBLAS fast path should be used (CUDA graph mode with active adapter)."""
         return self._cublas_mode
+
+    def update_lora_mask(self, mask_values: list):
+        """Update conditional LoRA mask. 1.0=apply LoRA, 0.0=base only.
+        Called by DreamShiftBlockN._setup_conditional_lora before each graph replay."""
+        if self.lora_mask is not None:
+            n = len(mask_values)
+            self.lora_mask[:n].copy_(
+                torch.tensor(mask_values, dtype=self.lora_mask.dtype, device=self.lora_mask.device),
+                non_blocking=True,
+            )
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -54,7 +68,13 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         if self._use_cublas():
             # weights: (num_lora, rank, input_dim)
             A = weights[self._cublas_adapter_idx]  # (rank, input_dim)
-            return torch.mm(x, A.t())  # (M, rank)
+            out = torch.mm(x, A.t())  # (M, rank)
+            # Apply conditional mask: zero out verify positions
+            # During capture: mask=all 1s (no-op, but mul_ gets baked into graph)
+            # During replay: mask updated by _setup_conditional_lora
+            if self.lora_mask is not None and self._cublas_mode:
+                out.mul_(self.lora_mask[: x.shape[0]].unsqueeze(1))
+            return out
         return chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=weights,
@@ -120,6 +140,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
             # Shrink: x @ A.T -> (M, 3*rank)
             lora_a_output = torch.mm(x, A.t())
+            # Apply conditional mask
+            if self.lora_mask is not None and self._cublas_mode:
+                lora_a_output.mul_(self.lora_mask[: x.shape[0]].unsqueeze(1))
 
             # Expand: apply each Q/K/V slice separately
             offsets_cpu = kwargs.get("output_offset_cpu", None)
@@ -177,6 +200,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
             # Shrink: x @ A.T -> (M, 2*rank)
             lora_a_output = torch.mm(x, A.t())
+            # Apply conditional mask
+            if self.lora_mask is not None and self._cublas_mode:
+                lora_a_output.mul_(self.lora_mask[: x.shape[0]].unsqueeze(1))
 
             # Expand: apply gate and up slices separately
             for i in range(2):
@@ -241,6 +267,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         ) * max_bs_in_cuda_graph
         max_num_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
         with torch.device("cuda"):
+            # Pre-allocate conditional LoRA mask (all 1s = apply LoRA everywhere during capture)
+            self.lora_mask = torch.ones(max_num_tokens, dtype=torch.bfloat16)
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,

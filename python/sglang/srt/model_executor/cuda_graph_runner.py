@@ -754,9 +754,12 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
-        # Mark cuBLAS graph as captured so prepare_lora_batch can be skipped
+        # Mark cuBLAS graph as captured so prepare_lora_batch can be skipped.
+        # Reset _cublas_mode so non-graph forwards (server warmup) don't use cuBLAS path.
         if getattr(self, '_cublas_lora_uid', None) is not None:
-            self.model_runner.lora_manager.lora_backend.cublas_graph_captured = True
+            lora_backend = self.model_runner.lora_manager.lora_backend
+            lora_backend.cublas_graph_captured = True
+            lora_backend._cublas_mode = False
             logger.info("cuBLAS LoRA ops captured in CUDA graph")
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
