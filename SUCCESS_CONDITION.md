@@ -1,21 +1,23 @@
 # Success Condition
 
 ## Done When
-All 13 benchmarks in PLAN.md results table have scores for b3 N=4 sampling.
+All 13 benchmarks × 5 runs completed. PLAN.md Results table fully filled with mean ± std for each benchmark.
 
-## Anomaly Gate
-- If any benchmark is > 15pp lower than N=3 reference: STOP and report to user
-- Otherwise: complete all benchmarks and report final comparison table
+## Minimum Requirement
+- 5 complete runs for each of the 13 benchmarks
+- Mean and std computed for each benchmark
+- Any benchmark with std > 3pp flagged as high-variance
 
-## Test Commands
+## Test Command
 ```bash
-# Verify servers running
+# Verify servers
 for i in $(seq 0 7); do curl -sf http://localhost:$((30000+i))/health && echo "GPU $i OK" || echo "GPU $i DOWN"; done
 
-# Sanity test
+# Quick sanity (5 problems of GSM8K)
 source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
-python scripts/eval_gsm8k.py --num-problems 5 --ports 30000
+python scripts/eval_gsm8k.py --num-problems 5 --ports 30000 --max-tokens 32768
 ```
 
-## Final Report Format
-Print a table comparing b3 N=4 vs b2 N=3 with delta for each benchmark.
+## Output
+Results saved in `bench_results/n3_run1/` through `bench_results/n3_run5/`.
+Final summary table in PLAN.md.
