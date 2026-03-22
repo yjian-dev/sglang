@@ -525,6 +525,17 @@ class CudaGraphRunner:
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
+            # For DLLM + cuBLAS: pre-load the first LoRA adapter into GPU memory
+            # so we can capture cuBLAS ops with real weight pointers.
+            lora_mgr = self.model_runner.lora_manager
+            self._cublas_lora_uid = None
+            if self.is_dllm and lora_mgr.loras:
+                uid = next(iter(lora_mgr.loras.keys()))
+                lora_mgr.fetch_new_loras(new_loras={uid})
+                self._cublas_lora_uid = uid
+                logger.info(
+                    f"Pre-loaded LoRA adapter '{uid}' for cuBLAS CUDA graph capture"
+                )
 
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -743,6 +754,11 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
+        # Mark cuBLAS graph as captured so prepare_lora_batch can be skipped
+        if getattr(self, '_cublas_lora_uid', None) is not None:
+            self.model_runner.lora_manager.lora_backend.cublas_graph_captured = True
+            logger.info("cuBLAS LoRA ops captured in CUDA graph")
+
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.model_runner.server_args.enable_memory_saver
@@ -831,9 +847,14 @@ class CudaGraphRunner:
             )
 
         if self.model_runner.server_args.enable_lora:
-            # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
-            # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
-            lora_ids = [None] * bs
+            # For DLLM + cuBLAS: use real LoRA adapter ID so cuBLAS mm/addmm_ ops
+            # are captured with real weight pointers (2-3x faster than csgmv).
+            cublas_uid = getattr(self, '_cublas_lora_uid', None)
+            if cublas_uid is not None:
+                lora_ids = [cublas_uid] * bs
+            else:
+                # Fallback: capture with empty LoRA IDs (csgmv no-op path).
+                lora_ids = [None] * bs
         else:
             lora_ids = None
 

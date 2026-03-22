@@ -275,6 +275,15 @@ class LoRAManager:
         )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        # When cuBLAS ops are captured in the CUDA graph, the graph replays
+        # baked-in mm/addmm_ ops regardless of batch_info. Skip the expensive
+        # permutation/segment computation during decode replay.
+        if (
+            self.lora_backend.cublas_graph_captured
+            and forward_batch.forward_mode.is_cuda_graph()
+        ):
+            return
+
         # set up batch info shared by all lora modules
         from sglang.srt.lora.utils import get_lora_segment_ids
 

@@ -20,6 +20,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     introduced in the Punica paper (https://arxiv.org/pdf/2310.18547). One main variation made here is to
     segment the input sequences into fixed-size chunks, which reduces excessive kernel launches especially
     when the LoRA distribution is skewed.
+
+    In CUDA graph mode, a cuBLAS fast path is used instead of the Triton csgmv kernels.
+    cuBLAS torch.mm/addmm_ is 2-3x faster than csgmv for small M (e.g. M=5 in DLLM decode).
     """
 
     name = "csgmv"
@@ -32,10 +35,26 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
+        # cuBLAS fast path state (set during prepare_lora_batch for CUDA graph mode)
+        self._cublas_adapter_idx = None
+        self._cublas_scaling = 1.0
+        self._cublas_mode = False
+        # When True, cuBLAS ops are captured in the CUDA graph.
+        # prepare_lora_batch can be skipped during replay since the graph
+        # replays baked-in cuBLAS ops regardless of batch_info.
+        self.cublas_graph_captured = False
+
+    def _use_cublas(self) -> bool:
+        """Check if cuBLAS fast path should be used (CUDA graph mode with active adapter)."""
+        return self._cublas_mode
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
+        if self._use_cublas():
+            # weights: (num_lora, rank, input_dim)
+            A = weights[self._cublas_adapter_idx]  # (rank, input_dim)
+            return torch.mm(x, A.t())  # (M, rank)
         return chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=weights,
@@ -52,6 +71,17 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        if self._use_cublas():
+            # weights: (num_lora, output_dim, rank)
+            B = weights[self._cublas_adapter_idx]  # (output_dim, rank)
+            if base_output is None:
+                base_output = torch.zeros(
+                    (x.shape[0], B.shape[0]), device=x.device, dtype=x.dtype
+                )
+            # base_output += scaling * x @ B.T
+            base_output.addmm_(x, B.t(), beta=1.0, alpha=self._cublas_scaling)
+            return base_output
+
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
         max_slice_size = output_dim
@@ -80,6 +110,30 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # qkv_lora_a: (num_lora, 3 * r, input_dim)
         # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
+
+        if self._use_cublas():
+            idx = self._cublas_adapter_idx
+            scaling = self._cublas_scaling
+            A = qkv_lora_a[idx]  # (3*rank, input_dim)
+            B = qkv_lora_b[idx]  # (total_out_dim, rank)
+            rank = A.shape[0] // 3
+
+            # Shrink: x @ A.T -> (M, 3*rank)
+            lora_a_output = torch.mm(x, A.t())
+
+            # Expand: apply each Q/K/V slice separately
+            offsets_cpu = kwargs.get("output_offset_cpu", None)
+            if offsets_cpu is None:
+                offsets_cpu = output_offset
+            for i in range(3):
+                a_slice = lora_a_output[:, i * rank : (i + 1) * rank]
+                off_start = int(offsets_cpu[i])
+                off_end = int(offsets_cpu[i + 1])
+                b_slice = B[off_start:off_end, :]  # (slice_dim, rank)
+                base_output[:, off_start:off_end].addmm_(
+                    a_slice, b_slice.t(), beta=1.0, alpha=scaling
+                )
+            return base_output
 
         lora_a_output = chunked_sgmv_lora_shrink_forward(
             x=x,
@@ -113,6 +167,25 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # gate_up_lora_b: (num_lora, 2 * output_dim, r)
         assert isinstance(gate_up_lora_b, torch.Tensor)
         output_dim = gate_up_lora_b.shape[-2] // 2
+
+        if self._use_cublas():
+            idx = self._cublas_adapter_idx
+            scaling = self._cublas_scaling
+            A = gate_up_lora_a[idx]  # (2*rank, input_dim)
+            B = gate_up_lora_b[idx]  # (2*output_dim, rank)
+            rank = A.shape[0] // 2
+
+            # Shrink: x @ A.T -> (M, 2*rank)
+            lora_a_output = torch.mm(x, A.t())
+
+            # Expand: apply gate and up slices separately
+            for i in range(2):
+                a_slice = lora_a_output[:, i * rank : (i + 1) * rank]
+                b_slice = B[i * output_dim : (i + 1) * output_dim, :]
+                base_output[:, i * output_dim : (i + 1) * output_dim].addmm_(
+                    a_slice, b_slice.t(), beta=1.0, alpha=scaling
+                )
+            return base_output
 
         # lora_a_output: (s, 2 * r)
         lora_a_output = chunked_sgmv_lora_shrink_forward(
@@ -189,6 +262,19 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         scalings: list[float],
         use_cuda_graph: bool,
     ):
+        # Set cuBLAS fast path for CUDA graph mode.
+        # Find the active LoRA adapter (non-zero scaling) from weight_indices.
+        # weight_index 0 with scaling 0 is the "no LoRA" slot.
+        self._cublas_mode = False
+        self._cublas_adapter_idx = None
+        if use_cuda_graph and len(weight_indices) > 0:
+            for wi in weight_indices:
+                if scalings[wi] != 0.0:
+                    self._cublas_adapter_idx = wi
+                    self._cublas_scaling = scalings[wi]
+                    self._cublas_mode = True
+                    break
+
         chunk_size = self._determine_chunk_size(forward_batch)
 
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
