@@ -60,21 +60,27 @@ def check_answer(pred_processed, gold_answers):
 
 def run_one(args):
     idx, question, gold_answers, port, max_tokens, timeout, temperature, top_p, top_k = args
-    prompt = f"Answer these questions, your answer should be as simple as possible, start your answer with the prompt 'The answer is '.\nQ: {question}?"
+    user_msg = f"Answer these questions, your answer should be as simple as possible, start your answer with the prompt 'The answer is '.\nQ: {question}?"
+    # Use /generate with raw prompt to include "A:" bot prefix (matching OC)
+    raw_prompt = (
+        f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        f"<|im_start|>assistant\nA:"
+    )
     try:
-        r = requests.post(f"http://localhost:{port}/v1/chat/completions", json={
-            "model": "default",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
+        r = requests.post(f"http://localhost:{port}/generate", json={
+            "text": raw_prompt,
+            "sampling_params": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            },
         }, timeout=timeout).json()
-        content = r["choices"][0]["message"]["content"]
+        content = r["text"]
         content = strip_thinking(content)
         # OC-compatible extraction: first line, split on prefixes, postprocess
         answer = extract_and_postprocess(content)
-        comp = r["usage"]["completion_tokens"]
+        comp = r.get("meta_info", {}).get("completion_tokens", len(content.split()))
         return idx, answer, gold_answers, comp, None
     except Exception as e:
         return idx, "", gold_answers, 0, str(e)
