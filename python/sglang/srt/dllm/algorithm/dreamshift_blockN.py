@@ -664,10 +664,12 @@ class DreamShiftBlockN(DllmAlgorithm):
                     all_corr_tokens_gpu = all_clean_logits.argmax(dim=-1)
                 elif _HAS_FUSED_VERIFY and self.verify_alpha > 0:
                     # Fused Triton kernel: softmax + ratio + Gumbel-max correction
-                    all_draft_probs_t = torch.stack(all_draft_prob_list)
+                    all_draft_logits_t = torch.stack(all_draft_prob_list)
                     self._gumbel_seed_counter += 1
-                    all_accepted_gpu, all_corr_tokens_gpu = fused_spec_verify(
-                        all_clean_logits, all_draft_probs_t, all_spec_vals_t,
+                    # Use from_logits variant: does softmax internally,
+                    # avoids pre-computing draft probs in the previous step
+                    all_accepted_gpu, all_corr_tokens_gpu = fused_spec_verify_from_logits(
+                        all_clean_logits, all_draft_logits_t, all_spec_vals_t,
                         temperature=self.temperature,
                         alpha=self.verify_alpha,
                         gumbel_seed=self._gumbel_seed_counter,
@@ -745,8 +747,9 @@ class DreamShiftBlockN(DllmAlgorithm):
                     if draft_indices:
                         draft_logits = all_sample_logits[draft_indices]
                         all_sample_ids_gpu[draft_indices] = draft_logits.argmax(dim=-1).to(clean_ids.dtype)
-                        scaled_draft = draft_logits if self.temperature == 1.0 else draft_logits / self.temperature
-                        draft_probs_all = F.softmax(scaled_draft, dim=-1)
+                        # Store scaled logits directly (defer softmax to next step's verify)
+                        # fused_spec_verify_from_logits does softmax internally
+                        draft_probs_all = draft_logits if self.temperature == 1.0 else draft_logits / self.temperature
                 else:
                     all_sample_ids_gpu, _ = _batched_sample(
                         all_sample_logits, self.temperature, self.top_k, self.top_p
