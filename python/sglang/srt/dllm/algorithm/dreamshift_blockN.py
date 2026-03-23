@@ -266,28 +266,31 @@ class DreamShiftBlockN(DllmAlgorithm):
         """
         lora_backend = model_runner.lora_manager.lora_backend
 
-        # Fast path: when cuBLAS graph is captured, just update the mask tensor
+        # Fast path: when cuBLAS graph is captured and batch fits in mask buffer,
+        # just update the mask tensor (avoids expensive segment computation).
         if lora_backend.cublas_graph_captured:
-            mask_values = []
-            for bid, extend_len in enumerate(extend_lens_cpu):
-                if extend_len <= 0:
-                    continue
-                req_lora_id = forward_batch.lora_ids[bid]
-                if req_lora_id is None or is_prefill[bid] or case_types[bid] == "P":
-                    mask_values.extend([0.0] * extend_len)
-                    continue
-                # Compute base_len (verify positions) and draft_len (MASK positions)
-                if case_types[bid] == "V":
-                    base_len = 1 + len(old_specs[bid] or [])
-                else:  # Cold start
-                    base_len = 1
-                draft_len = self.num_masks
-                pad_len = extend_len - base_len - draft_len
-                mask_values.extend([0.0] * base_len)      # verify: no LoRA
-                mask_values.extend([1.0] * draft_len)      # MASK: apply LoRA
-                mask_values.extend([0.0] * max(0, pad_len))  # padding: no LoRA
-            lora_backend.update_lora_mask(mask_values)
-            return
+            total_tokens = sum(el for el in extend_lens_cpu if el > 0)
+            if lora_backend.lora_mask is not None and total_tokens <= lora_backend.lora_mask.shape[0]:
+                mask_values = []
+                for bid, extend_len in enumerate(extend_lens_cpu):
+                    if extend_len <= 0:
+                        continue
+                    req_lora_id = forward_batch.lora_ids[bid]
+                    if req_lora_id is None or is_prefill[bid] or case_types[bid] == "P":
+                        mask_values.extend([0.0] * extend_len)
+                        continue
+                    if case_types[bid] == "V":
+                        base_len = 1 + len(old_specs[bid] or [])
+                    else:
+                        base_len = 1
+                    draft_len = self.num_masks
+                    pad_len = extend_len - base_len - draft_len
+                    mask_values.extend([0.0] * base_len)
+                    mask_values.extend([1.0] * draft_len)
+                    mask_values.extend([0.0] * max(0, pad_len))
+                lora_backend.update_lora_mask(mask_values)
+                return
+            # else: fall through to segment-based routing for large batches
 
         # Non-graph path: use segment-based routing (original csgmv path)
         blk = self.block_size

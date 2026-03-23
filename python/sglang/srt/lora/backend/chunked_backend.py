@@ -68,10 +68,13 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         Called by DreamShiftBlockN._setup_conditional_lora before each graph replay."""
         if self.lora_mask is not None:
             n = len(mask_values)
-            self.lora_mask[:n].copy_(
-                torch.tensor(mask_values, dtype=self.lora_mask.dtype, device=self.lora_mask.device),
-                non_blocking=True,
-            )
+            # Only update if mask fits in pre-allocated buffer (graph replay).
+            # Larger batches (mixed prefill+decode) go through non-graph path.
+            if n <= self.lora_mask.shape[0]:
+                self.lora_mask[:n].copy_(
+                    torch.tensor(mask_values, dtype=self.lora_mask.dtype, device=self.lora_mask.device),
+                    non_blocking=True,
+                )
 
     def can_overlap(self) -> bool:
         """Check if two-stream overlap is available (cuBLAS mode with initialized stream)."""
