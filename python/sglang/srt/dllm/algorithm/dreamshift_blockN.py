@@ -346,6 +346,12 @@ class DreamShiftBlockN(DllmAlgorithm):
         device = forward_batch.input_ids.device
         blk = self.block_size  # 2*N - 1
 
+        # Start flashinfer metadata init early (async GPU) so it overlaps
+        # with the CPU-side classify phase below.
+        _graph_runner = getattr(model_runner, 'graph_runner', None)
+        if _graph_runner is not None:
+            _graph_runner.init_dllm_metadata_early(forward_batch)
+
         # Compute per-request extend lengths and cumulative offsets
         # for mixed decode+prefill batches (variable-length ragged layout)
         _el = forward_batch.extend_seq_lens
