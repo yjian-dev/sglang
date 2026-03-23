@@ -23,6 +23,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     In CUDA graph mode, a cuBLAS fast path is used instead of the Triton csgmv kernels.
     cuBLAS torch.mm/addmm_ is 2-3x faster than csgmv for small M (e.g. M=5 in DLLM decode).
+
+    Two-stream overlap: When enabled, LoRA shrink (mm + mask) runs on a separate
+    CUDA stream concurrently with the base model matmul. The expand (addmm_) runs
+    after both complete. This hides ~50% of LoRA kernel latency.
     """
 
     name = "csgmv"
@@ -48,6 +52,13 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # Applied after shrink mm to zero out verify positions' LoRA contribution.
         self.lora_mask: torch.Tensor = None
 
+        # Two-stream overlap state
+        self._overlap_enabled = False
+        self.lora_stream: torch.cuda.Stream = None
+        # Pre-allocated shrink output buffers keyed by num_slices (1, 2, 3).
+        # Avoids tensor allocation on the side stream during CUDA graph capture.
+        self._shrink_bufs: dict[int, torch.Tensor] = {}
+
     def _use_cublas(self) -> bool:
         """Check if cuBLAS fast path should be used (CUDA graph mode with active adapter)."""
         return self._cublas_mode
@@ -61,6 +72,91 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 torch.tensor(mask_values, dtype=self.lora_mask.dtype, device=self.lora_mask.device),
                 non_blocking=True,
             )
+
+    def can_overlap(self) -> bool:
+        """Check if two-stream overlap is available (cuBLAS mode with initialized stream)."""
+        return self._overlap_enabled and self._cublas_mode and self.lora_stream is not None
+
+    def run_cublas_shrink(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        num_slices: int,
+    ) -> torch.Tensor:
+        """Run LoRA shrink (mm + mask) into a pre-allocated buffer.
+
+        Must be called on self.lora_stream. Writes into self._shrink_bufs[num_slices].
+        Returns the shrink output (a view of the pre-allocated buffer sized to x.shape[0]).
+        """
+        idx = self._cublas_adapter_idx
+        A = weights[idx]  # (num_slices * rank, input_dim)
+        M = x.shape[0]
+        total_rank = A.shape[0]  # num_slices * rank
+
+        self._ensure_shrink_buf(num_slices, total_rank)
+        buf = self._shrink_bufs[num_slices]
+        out = buf[:M, :total_rank]
+        torch.mm(x, A.t(), out=out)
+
+        # Apply conditional mask
+        if self.lora_mask is not None:
+            out.mul_(self.lora_mask[:M].unsqueeze(1))
+
+        return out
+
+    def run_cublas_expand_simple(
+        self,
+        shrink_out: torch.Tensor,
+        B_weights: torch.Tensor,
+        base_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run LoRA expand (addmm_) for simple layers (ColumnParallel, RowParallel).
+
+        Adds shrink_out @ B.T * scaling into base_output in-place.
+        """
+        B = B_weights[self._cublas_adapter_idx]  # (output_dim, rank)
+        base_output.addmm_(shrink_out, B.t(), beta=1.0, alpha=self._cublas_scaling)
+        return base_output
+
+    def run_cublas_expand_qkv(
+        self,
+        shrink_out: torch.Tensor,
+        B_weights: torch.Tensor,
+        base_output: torch.Tensor,
+        output_offset_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run LoRA expand for QKV layers (3-slice addmm_)."""
+        B = B_weights[self._cublas_adapter_idx]  # (total_out_dim, rank)
+        rank = shrink_out.shape[1] // 3
+        scaling = self._cublas_scaling
+        for i in range(3):
+            a_slice = shrink_out[:, i * rank : (i + 1) * rank]
+            off_start = int(output_offset_cpu[i])
+            off_end = int(output_offset_cpu[i + 1])
+            b_slice = B[off_start:off_end, :]
+            base_output[:, off_start:off_end].addmm_(
+                a_slice, b_slice.t(), beta=1.0, alpha=scaling
+            )
+        return base_output
+
+    def run_cublas_expand_gate_up(
+        self,
+        shrink_out: torch.Tensor,
+        B_weights: torch.Tensor,
+        base_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run LoRA expand for GateUp layers (2-slice addmm_)."""
+        B = B_weights[self._cublas_adapter_idx]  # (2*output_dim, rank)
+        output_dim = B.shape[0] // 2
+        rank = shrink_out.shape[1] // 2
+        scaling = self._cublas_scaling
+        for i in range(2):
+            a_slice = shrink_out[:, i * rank : (i + 1) * rank]
+            b_slice = B[i * output_dim : (i + 1) * output_dim, :]
+            base_output[:, i * output_dim : (i + 1) * output_dim].addmm_(
+                a_slice, b_slice.t(), beta=1.0, alpha=scaling
+            )
+        return base_output
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -280,6 +376,25 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 num_segments=None,  # Set per batch
                 max_len=None,  # Not used in CSGMV backend
+            )
+
+        # Two-stream overlap: create side stream and pre-allocate shrink buffers.
+        # The rank is not known yet (depends on adapter), so we use a generous
+        # max_rank and allocate lazily on first use in _ensure_shrink_buf().
+        self.lora_stream = torch.cuda.Stream(device=self.device)
+        self._overlap_max_tokens = max_num_tokens
+        self._overlap_enabled = True
+
+    def _ensure_shrink_buf(
+        self, num_slices: int, total_rank: int
+    ) -> None:
+        """Ensure pre-allocated shrink buffer exists for given num_slices and is large enough."""
+        buf = self._shrink_bufs.get(num_slices)
+        if buf is None or buf.shape[0] < self._overlap_max_tokens or buf.shape[1] < total_rank:
+            self._shrink_bufs[num_slices] = torch.zeros(
+                (self._overlap_max_tokens, total_rank),
+                dtype=torch.bfloat16,
+                device=self.device,
             )
 
     def prepare_lora_batch(
