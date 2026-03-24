@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
@@ -355,37 +356,262 @@ class SchedulerOutputProcessorMixin:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
-    def process_batch_result_dllm(
+    def process_batch_result_dllm_critical(
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        """Critical-path processing: KV free + state updates + output_ids + finished check.
+        Must run BEFORE prepare_for_dllm_decode of next step."""
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        dllm_algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        kv_trim_info = getattr(dllm_algo, "_kv_trim_info", {}) if dllm_algo else {}
+        advance_override = getattr(dllm_algo, "_advance_override", {}) if dllm_algo else {}
+        dllm_write_override = getattr(dllm_algo, "_dllm_write_override", {}) if dllm_algo else {}
+
+        # KV free (needed so prep can allocate new slots)
+        kv_gpu_parts = []
         for idx in range(batch.batch_size()):
-            # If no new tokens generated, meaning the prefilling stage
+            if not result.next_token_ids:
+                break
+            trim_info = kv_trim_info.get(batch.reqs[idx].req_pool_idx)
+            if trim_info is not None:
+                gpu_indices = trim_info.get("kv_indices_gpu")
+                if gpu_indices is not None:
+                    kv_gpu_parts.append(gpu_indices)
+        if kv_gpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+
+        # Update state + output_ids + finished check (all needed before next step)
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            req = batch.reqs[idx]
+            req_pool_idx = req.req_pool_idx
+            raw = result.next_token_ids[idx]
+            next_token_ids = raw if isinstance(raw, list) else raw.tolist()
+
+            # KV state updates
+            trim_info = kv_trim_info.get(req_pool_idx)
+            if trim_info is not None:
+                trim_count = trim_info["trim_count"]
+                req.kv_committed_len -= trim_count
+                req.kv_allocated_len -= trim_count
+                req.dllm_kv_valid_len = req.kv_committed_len
+            else:
+                req.dllm_kv_valid_len = None
+            adv = advance_override.get(req_pool_idx)
+            if adv is not None:
+                req.dllm_next_advance = adv
+
+            # dllm_ids write
+            is_inline_pf = getattr(req, '_inline_prefill', False)
+            if next_token_ids and not is_inline_pf:
+                self.num_generated_tokens += len(next_token_ids)
+                dllm_tokens = dllm_write_override.pop(req_pool_idx, None)
+                if req.dllm_ids and dllm_tokens is not None:
+                    write_start = req.dllm_block_offset
+                    req.dllm_ids[write_start:write_start + len(dllm_tokens)] = dllm_tokens
+
+                # output_ids + finished check (needed for filter_batch)
+                for next_token_id in next_token_ids:
+                    req.output_ids.append(next_token_id)
+                    req.check_finished()
+                    if req.finished():
+                        from sglang.srt.managers.scheduler_output_processor_mixin import release_kv_cache
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
+                        if dllm_algo is not None:
+                            dllm_algo.cleanup_request(req_pool_idx)
+                        break
+
+        self.token_to_kv_pool_allocator.free_group_end()
+        # stream_output must run in critical path (clients wait for response)
+        self.stream_output(batch.reqs, batch.return_logprob)
+
+    def process_batch_result_dllm_deferred(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        """Deferred processing: logging + cleanup.
+        Runs during overlap window (while GPU is computing next step)."""
+        self.log_batch_result_stats(batch, result)
+        self._maybe_clear_mm_inputs(batch)
+        self.maybe_send_health_check_signal()
+
+    def process_batch_result_dllm(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        import time as _time
+        _tp0 = _time.perf_counter()
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        _tp1 = _time.perf_counter()
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        # Read algorithm signals for KV trim / dllm_ids override
+        dllm_algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        dllm_write_override = (
+            getattr(dllm_algo, "_dllm_write_override", {}) if dllm_algo else {}
+        )
+        kv_trim_info = (
+            getattr(dllm_algo, "_kv_trim_info", {}) if dllm_algo else {}
+        )
+        advance_override = (
+            getattr(dllm_algo, "_advance_override", {}) if dllm_algo else {}
+        )
+
+        if not result.next_token_ids:
+            # Pure prefill batch (no decode requests)
+            for req in batch.reqs:
+                self.tree_cache.cache_unfinished_req(req)
+                if req.is_dllm() and req.is_dllm_prefill():
+                    origin_len = len(req.origin_input_ids)
+                    cached_len = (
+                        len(req.prefix_indices)
+                        if req.prefix_indices is not None
+                        else 0
+                    )
+                    if cached_len >= origin_len:
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        req.dllm_next_advance = origin_len
+                        req._inline_prefill = False
+
+        # Batch KV free: collect GPU tensor slices directly (no CPU round-trip)
+        kv_gpu_parts = []
+        kv_cpu_parts = []
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            trim_info = kv_trim_info.get(batch.reqs[idx].req_pool_idx)
+            if trim_info is not None:
+                gpu_indices = trim_info.get("kv_indices_gpu")
+                if gpu_indices is not None:
+                    kv_gpu_parts.append(gpu_indices)
+                else:
+                    cpu_indices = trim_info.get("kv_indices")
+                    if cpu_indices:
+                        kv_cpu_parts.extend(cpu_indices)
+        if kv_gpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+        if kv_cpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.tensor(
+                kv_cpu_parts, dtype=torch.int64,
+                device=self.token_to_kv_pool_allocator.device,
+            ))
+
+        for idx in range(batch.batch_size()):
             if not result.next_token_ids:
                 break
 
             req = batch.reqs[idx]
-            next_token_ids = result.next_token_ids[idx].tolist()
+            raw = result.next_token_ids[idx]
+            next_token_ids = raw if isinstance(raw, list) else raw.tolist()
+
+            # Handle inline prefill requests in mixed batch:
+            # Force-treat _inline_prefill requests as pure prefill regardless
+            # of what the algorithm returned (it may not know about inline prefill).
+            is_inline_pf = getattr(req, '_inline_prefill', False)
+            if not next_token_ids or is_inline_pf:
+                self.tree_cache.cache_unfinished_req(req)
+                # Transition prefill → decode
+                if req.is_dllm() and (req.is_dllm_prefill() or is_inline_pf):
+                    origin_len = len(req.origin_input_ids)
+                    cached_len = (
+                        len(req.prefix_indices)
+                        if req.prefix_indices is not None
+                        else 0
+                    )
+                    if cached_len >= origin_len:
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        req.dllm_next_advance = origin_len
+                        req._inline_prefill = False
+                continue
+
             self.num_generated_tokens += len(next_token_ids)
 
-            for _token_idx, next_token_id in enumerate(next_token_ids):
+            req_pool_idx = req.req_pool_idx
+            dllm_tokens = dllm_write_override.pop(req_pool_idx, None)
+            if req.dllm_ids:
+                if dllm_tokens is not None:
+                    write_start = req.dllm_block_offset
+                    req.dllm_ids[
+                        write_start : write_start + len(dllm_tokens)
+                    ] = dllm_tokens
+                elif next_token_ids:
+                    block_size = req.dllm_config.block_size
+                    write_start = (
+                        req.dllm_block_offset
+                        + block_size
+                        - len(next_token_ids)
+                    )
+                    req.dllm_ids[
+                        write_start : write_start + len(next_token_ids)
+                    ] = next_token_ids
+
+            trim_info = kv_trim_info.pop(req_pool_idx, None)
+            if trim_info is not None:
+                trim_count = trim_info["trim_count"]
+                req.kv_committed_len -= trim_count
+                req.kv_allocated_len -= trim_count
+                req.dllm_kv_valid_len = req.kv_committed_len
+            else:
+                req.dllm_kv_valid_len = None
+
+            adv = advance_override.pop(req_pool_idx, None)
+            if adv is not None:
+                req.dllm_next_advance = adv
+
+            finished = False
+            for next_token_id in next_token_ids:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
+                    if dllm_algo is not None:
+                        dllm_algo.cleanup_request(req_pool_idx)
+                    finished = True
                     break
+            if not finished:
+                # In fast decode loop, skip expensive cache_unfinished_req
+                # (GPU tensor copy per req). prepare_for_dllm_decode uses
+                # kv_committed_len instead of prefix_indices for decode reqs.
+                if not getattr(batch, '_dllm_decode_mode', False) or is_inline_pf:
+                    self.tree_cache.cache_unfinished_req(req)
 
-                self.tree_cache.cache_unfinished_req(req)
-
+        _tp2 = _time.perf_counter()
         self.stream_output(batch.reqs, batch.return_logprob)
+        _tp3 = _time.perf_counter()
         self.token_to_kv_pool_allocator.free_group_end()
+        _tp4 = _time.perf_counter()
+
+        # Accumulate process timing
+        _proc_timing = getattr(self, '_dllm_proc_timing', None)
+        if _proc_timing is None:
+            _proc_timing = {'sync': 0, 'loop': 0, 'stream': 0, 'free': 0, 'count': 0}
+            self._dllm_proc_timing = _proc_timing
+        _proc_timing['sync'] += (_tp1 - _tp0)
+        _proc_timing['loop'] += (_tp2 - _tp1)
+        _proc_timing['stream'] += (_tp3 - _tp2)
+        _proc_timing['free'] += (_tp4 - _tp3)
+        _proc_timing['count'] += 1
+        if _proc_timing['count'] % 500 == 0:
+            c = _proc_timing['count']
+            logger.info(
+                f"[DLLM process] avg(ms): sync={_proc_timing['sync']/c*1000:.2f} "
+                f"loop={_proc_timing['loop']/c*1000:.2f} "
+                f"stream={_proc_timing['stream']/c*1000:.2f} "
+                f"free={_proc_timing['free']/c*1000:.2f}"
+            )
 
         if self.current_scheduler_metrics_enabled:
             can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
@@ -982,6 +1208,12 @@ class SchedulerOutputProcessorMixin:
                         if not self.model_config.is_multimodal_gen
                         else False
                     )
+
+            # Skip if no new tokens since last stream (avoids empty pipeline round-trip,
+            # critical for DLLM where prefill produces 0 tokens)
+            if should_output and not req.finished():
+                if req.send_token_offset >= len(req.output_ids):
+                    should_output = False
 
             if should_output:
                 send_token_offset = req.send_token_offset

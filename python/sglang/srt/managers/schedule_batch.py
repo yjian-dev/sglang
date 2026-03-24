@@ -55,7 +55,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.dllm.mixin.req import ReqDllmMixin
+from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2001,6 +2001,211 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+    def prepare_for_dllm_decode(self):
+        """Lightweight DLLM decode prep — handles mixed decode + inline prefill.
+
+        IMPORTANT: Allocates KV BEFORE modifying req state so that on allocation
+        failure, no state is corrupted and the caller can safely fall back.
+
+        Supports mixed batches: decode requests use block_size tokens,
+        inline prefill requests use their full prompt tokens. The algorithm
+        detects prefill requests (no MASKs) and handles them differently.
+        """
+        from sglang.srt.mem_cache.common import alloc_token_slots
+
+        bs = len(self.reqs)
+        block_size = self.dllm_config.block_size
+
+        # 1. Compute per-request extend lengths BEFORE allocation
+        extend_lens = [0] * bs
+        for i, req in enumerate(self.reqs):
+            if getattr(req, '_inline_prefill', False):
+                # Inline prefill: use prompt tokens (already set by absorber)
+                prefix_len = len(req.prefix_indices)
+                origin_remaining = len(req.origin_input_ids) - prefix_len
+                if origin_remaining <= 0:
+                    # Prefill already done, will transition to decode in step 3
+                    extend_lens[i] = block_size
+                else:
+                    extend_lens[i] = origin_remaining
+            else:
+                extend_lens[i] = block_size
+
+        # 2. PRE-ALLOCATE KV slots BEFORE any state mutation
+        num_tokens = sum(extend_lens)
+        try:
+            out_cache_loc = alloc_token_slots(self.tree_cache, num_tokens)
+        except RuntimeError:
+            return False
+        if out_cache_loc is None:
+            return False
+
+        # 3. Now safe to modify req state
+        _pure_decode = all(el == block_size for el in extend_lens)
+        # PackInfer §3.1: sort by kv_committed_len so adjacent requests have similar
+        # KV lengths, reducing tile imbalance in flashinfer attention kernel.
+        if _pure_decode and bs > 1:
+            self.reqs.sort(key=lambda r: r.kv_committed_len)
+        input_ids_list = [] if not _pure_decode else None  # Skip for pure decode
+        seq_lens = [0] * bs
+        prefix_lens = [0] * bs
+        rpx_list = [0] * bs
+
+        for i, req in enumerate(self.reqs):
+            is_prefill = getattr(req, '_inline_prefill', False)
+
+            if is_prefill:
+                # Prefill: use origin_input_ids (prompt only, no MASKs)
+                # init_next_round_input was already called by the absorber
+                prefix_len = len(req.prefix_indices)
+                origin_remaining = len(req.origin_input_ids) - prefix_len
+                if origin_remaining <= 0:
+                    # Prefill complete — transition to decode mode
+                    req._inline_prefill = False
+                    req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                    req.dllm_next_advance = len(req.origin_input_ids)
+                    is_prefill = False
+                    extend_lens[i] = block_size
+                    # Fall through to decode path below
+                else:
+                    ext_len = extend_lens[i]
+                    req.extend_input_len = ext_len
+                    req.fill_ids = req.fill_ids[:prefix_len + ext_len]
+            if not is_prefill:
+                if _pure_decode:
+                    # Fast path: inline _init_fill_ids_for_dllm + skip set_extend_input_len
+                    advance = (
+                        req.dllm_next_advance
+                        if req.dllm_next_advance is not None
+                        else block_size
+                    )
+                    req.dllm_next_advance = None
+                    req.dllm_block_offset += advance
+                    # Grow dllm_ids (needed by output processor for write_override)
+                    req.dllm_ids += [self.dllm_config.mask_id] * block_size
+                    prefix_len = req.kv_committed_len
+                    req.extend_input_len = block_size
+                else:
+                    # Slow path: full init
+                    req.init_next_round_input()
+                    req.extend_input_len = min(req.extend_input_len, block_size)
+                    prefix_len = getattr(req, 'kv_committed_len', None) or len(req.prefix_indices)
+                    req.fill_ids = req.fill_ids[:prefix_len + req.extend_input_len]
+
+            if not _pure_decode:
+                input_ids_list.extend(req.fill_ids[prefix_len:])
+            sl = prefix_len + extend_lens[i]
+            seq_lens[i] = sl
+            prefix_lens[i] = prefix_len
+            rpx_list[i] = req.req_pool_idx
+
+        # 4. Rebuild batch tensors (reuse pre-allocated buffers when possible)
+        self.forward_mode = ForwardMode.DLLM_EXTEND
+
+        # Reuse req_pool_indices (doesn't change between decode steps with same batch)
+        _rpx_cache = getattr(self, '_dllm_rpx_cache', None)
+        if _pure_decode and _rpx_cache is not None and _rpx_cache[0] == rpx_list:
+            self.req_pool_indices = _rpx_cache[1]
+        else:
+            self.req_pool_indices = torch.tensor(
+                rpx_list, dtype=torch.int64, device=self.device,
+            )
+            if _pure_decode:
+                self._dllm_rpx_cache = (rpx_list[:], self.req_pool_indices)
+
+        # Optimization: for pure-decode batches, reuse pre-filled MASK template.
+        # The algorithm's classify phase overwrites non-mask positions in-place.
+        _buf = getattr(self, '_dllm_input_ids_buf', None)
+        if _pure_decode and _buf is not None and _buf.shape[0] == num_tokens:
+            # Fast path: fill with mask_id, skip CPU→GPU transfer
+            _buf.fill_(self.dllm_config.mask_id)
+            self.input_ids = _buf
+        elif _pure_decode:
+            # First pure-decode step: create and cache the buffer
+            self.input_ids = torch.full(
+                (num_tokens,), self.dllm_config.mask_id,
+                dtype=torch.int64, device=self.device
+            )
+            self._dllm_input_ids_buf = self.input_ids
+        else:
+            self.input_ids = torch.tensor(
+                input_ids_list, dtype=torch.int64, device=self.device
+            )
+
+        # Build seq_lens tensors
+        _sl_t = torch.tensor(seq_lens, dtype=torch.int64)
+        _sl_gpu = getattr(self, '_dllm_seq_lens_gpu', None)
+        if _pure_decode and _sl_gpu is not None and _sl_gpu.shape[0] == bs:
+            _sl_gpu.copy_(_sl_t)
+            self.seq_lens = _sl_gpu
+        else:
+            self.seq_lens = _sl_t.to(self.device)
+            if _pure_decode:
+                self._dllm_seq_lens_gpu = self.seq_lens
+        self.seq_lens_cpu = _sl_t
+        self.orig_seq_lens = self.seq_lens.to(dtype=torch.int32)
+        # Incremental seq_lens_sum: pure decode adds exactly bs*block_size each step
+        _prev_sum = getattr(self, '_dllm_seq_lens_sum_cache', None)
+        if _pure_decode and _prev_sum is not None and _prev_sum[0] == bs:
+            self.seq_lens_sum = _prev_sum[1] + bs * block_size
+        else:
+            self.seq_lens_sum = sum(seq_lens)
+        self._dllm_seq_lens_sum_cache = (bs, self.seq_lens_sum)
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.extend_num_tokens = num_tokens
+        self.extend_logprob_start_lens = None
+        self.output_ids = None
+        self.lora_ids = [req.lora_id for req in self.reqs]
+
+        # 5. Write KV slots via batched scatter
+        # Vectorized for pure-decode batches (all extend_lens == block_size)
+        if all(el == block_size for el in extend_lens):
+            # Fast path: uniform extend lengths — use vectorized torch ops
+            # Cache pos_offsets (constant for fixed bs/block_size) and rpx_indices (stable batch)
+            _scatter_cache = getattr(self, '_dllm_scatter_cache', None)
+            _cache_key = (bs, block_size, tuple(rpx_list))
+            if _scatter_cache is not None and _scatter_cache[0] == _cache_key:
+                rpx_indices, pos_offsets = _scatter_cache[1], _scatter_cache[2]
+            else:
+                rpx_t = torch.tensor(rpx_list, dtype=torch.long)
+                rpx_indices = rpx_t.repeat_interleave(block_size)
+                pos_offsets = torch.arange(block_size).repeat(bs)
+                self._dllm_scatter_cache = (_cache_key, rpx_indices, pos_offsets)
+            pl_t = torch.tensor(prefix_lens, dtype=torch.long)
+            pos_base = pl_t.repeat_interleave(block_size)
+            pos_indices = pos_base + pos_offsets
+            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
+                self.req_to_token_pool.req_to_token.dtype
+            )
+        else:
+            # Mixed batch: variable extend lengths (inline prefill)
+            rpx_indices = [0] * num_tokens
+            pos_indices = [0] * num_tokens
+            offset = 0
+            for i in range(bs):
+                rpx = rpx_list[i]
+                pl = prefix_lens[i]
+                ext = extend_lens[i]
+                for t in range(ext):
+                    rpx_indices[offset] = rpx
+                    pos_indices[offset] = pl + t
+                    offset += 1
+            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
+                self.req_to_token_pool.req_to_token.dtype
+            )
+        self.out_cache_loc = out_cache_loc
+
+        # 6. Cache CPU-side values so the algorithm can skip GPU→CPU syncs
+        self._dllm_rpx_cpu = rpx_list
+        self._dllm_seq_lens_cpu = seq_lens
+
+        # 7. Update per-request memory fields
+        for i, req in enumerate(self.reqs):
+            req.kv_committed_len = seq_lens[i]
+            req.kv_allocated_len = seq_lens[i]
+        return True
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2204,6 +2409,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            dllm_rpx_cpu=getattr(self, '_dllm_rpx_cpu', None),
+            dllm_seq_lens_cpu=getattr(self, '_dllm_seq_lens_cpu', None),
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2383,6 +2590,9 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+    # Cached CPU values from prepare_for_dllm_decode (avoids GPU→CPU sync in algorithm)
+    dllm_rpx_cpu: Optional[List[int]] = None
+    dllm_seq_lens_cpu: Optional[List[int]] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

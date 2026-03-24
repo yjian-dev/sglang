@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1100,6 +1101,346 @@ class Scheduler(
                 )
 
     @DynamicGradMode()
+    def _inline_absorb_new_requests(self, batch):
+        """Absorb new requests into the decode batch WITHOUT a separate forward pass.
+
+        New requests are added to batch.reqs and marked as pending prefill.
+        prepare_for_dllm_decode handles mixed decode+prefill batches, and
+        the algorithm detects prefill requests (no MASKs) to handle them
+        differently (save last logits only, no output tokens).
+        """
+        if not self.waiting_queue:
+            return
+
+        max_reqs = self.dllm_config.max_running_requests
+        current_bs = len(batch.reqs)
+        capacity = max_reqs - current_bs
+        if capacity <= 0:
+            return
+
+        # Limit by token count to avoid OOM from large logits buffers
+        max_absorb_tokens = 4096
+        est_tokens_per_req = 300
+        max_absorb_by_tokens = max(1, max_absorb_tokens // est_tokens_per_req)
+        # Also limit by available req pool slots (leave headroom for outer scheduler)
+        req_pool_avail = self.req_to_token_pool.available_size()
+        num_to_add = min(capacity, len(self.waiting_queue), max_absorb_by_tokens, req_pool_avail)
+        new_reqs = self.waiting_queue[:num_to_add]
+        self.waiting_queue = self.waiting_queue[num_to_add:]
+
+        # Allocate req_pool_idx for new requests
+        try:
+            req_pool_indices = self.req_to_token_pool.alloc(new_reqs)
+        except Exception:
+            self.waiting_queue = list(new_reqs) + self.waiting_queue
+            return
+        if req_pool_indices is None:
+            self.waiting_queue = list(new_reqs) + self.waiting_queue
+            return
+
+        # Initialize and add directly to batch — no separate forward pass.
+        # prepare_for_dllm_decode will include their prompt tokens in the
+        # next decode forward, and the algorithm will handle them as prefill.
+        absorbed = 0
+        for i, req in enumerate(new_reqs):
+            req.req_pool_idx = req_pool_indices[i]
+            req.init_next_round_input(self.tree_cache)
+            prefix_len = len(req.prefix_indices)
+            origin_remaining = len(req.origin_input_ids) - prefix_len
+            if origin_remaining <= 0:
+                req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                req.dllm_next_advance = len(req.origin_input_ids)
+            # Mark as pending inline prefill — prepare_for_dllm_decode
+            # will use origin_input_ids instead of MASK tokens
+            req._inline_prefill = req.is_dllm_prefill()
+            batch.reqs.append(req)
+            absorbed += 1
+
+        if absorbed > 0:
+            if batch.multimodal_inputs is not None:
+                batch.multimodal_inputs.extend([None] * absorbed)
+            from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+            batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                batch, self.model_config.vocab_size
+            )
+            self.dllm_manager.staging_queue = [
+                r for r in batch.reqs if not r.finished()
+            ]
+
+    def _process_dllm_critical_inline(self, batch, result):
+        """Critical-path DLLM processing: KV free + state update + finished check.
+
+        Defers stream_output to the next step's overlap window to reduce
+        the serial CPU gap between GPU forward calls (NanoFlow-style async).
+        """
+        import torch
+
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        dllm_algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        kv_trim_info = getattr(dllm_algo, "_kv_trim_info", {}) if dllm_algo else {}
+        advance_override = getattr(dllm_algo, "_advance_override", {}) if dllm_algo else {}
+        dllm_write_override = getattr(dllm_algo, "_dllm_write_override", {}) if dllm_algo else {}
+
+        # Batch KV free
+        kv_gpu_parts = []
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            trim_info = kv_trim_info.get(batch.reqs[idx].req_pool_idx)
+            if trim_info is not None:
+                gpu_indices = trim_info.get("kv_indices_gpu")
+                if gpu_indices is not None:
+                    kv_gpu_parts.append(gpu_indices)
+        if kv_gpu_parts:
+            self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+
+        # State updates + output_ids + finished check
+        for idx in range(batch.batch_size()):
+            if not result.next_token_ids:
+                break
+            req = batch.reqs[idx]
+            req_pool_idx = req.req_pool_idx
+            raw = result.next_token_ids[idx]
+            next_token_ids = raw if isinstance(raw, list) else raw.tolist()
+
+            is_inline_pf = getattr(req, '_inline_prefill', False)
+            if not next_token_ids or is_inline_pf:
+                if not getattr(batch, '_dllm_decode_mode', False) or is_inline_pf:
+                    self.tree_cache.cache_unfinished_req(req)
+                if req.is_dllm() and (req.is_dllm_prefill() or is_inline_pf):
+                    origin_len = len(req.origin_input_ids)
+                    cached_len = len(req.prefix_indices) if req.prefix_indices is not None else 0
+                    if cached_len >= origin_len:
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        req.dllm_next_advance = origin_len
+                        req._inline_prefill = False
+                continue
+
+            self.num_generated_tokens += len(next_token_ids)
+
+            # KV state
+            trim_info = kv_trim_info.get(req_pool_idx)
+            if trim_info is not None:
+                trim_count = trim_info["trim_count"]
+                req.kv_committed_len -= trim_count
+                req.kv_allocated_len -= trim_count
+                req.dllm_kv_valid_len = req.kv_committed_len
+            else:
+                req.dllm_kv_valid_len = None
+
+            adv = advance_override.get(req_pool_idx)
+            if adv is not None:
+                req.dllm_next_advance = adv
+
+            # dllm_ids write
+            dllm_tokens = dllm_write_override.pop(req_pool_idx, None)
+            if req.dllm_ids and dllm_tokens is not None:
+                write_start = req.dllm_block_offset
+                req.dllm_ids[write_start:write_start + len(dllm_tokens)] = dllm_tokens
+
+            # output_ids + finished check
+            for next_token_id in next_token_ids:
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+                if req.finished():
+                    from sglang.srt.managers.scheduler_output_processor_mixin import release_kv_cache
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    if dllm_algo is not None:
+                        dllm_algo.cleanup_request(req_pool_idx)
+                    break
+
+        self.token_to_kv_pool_allocator.free_group_end()
+
+    def _dllm_decode_loop(self, initial_batch):
+        """DLLM decode-mode inner loop: reuse batch with prepare_for_dllm_decode.
+
+        Overlaps recv_requests with GPU forward to hide scheduling latency.
+        """
+        steps = 0
+        exit_reason = "unknown"
+        batch = initial_batch
+        batch._dllm_decode_mode = True
+        # Timing accumulators (ms)
+        _t_prep = 0.0
+        _t_forward = 0.0
+        _t_process = 0.0
+        _t_sched = 0.0
+        _t_recv = 0.0
+        _t_filter = 0.0
+        _t_absorb = 0.0
+        _n_absorb = 0
+        _recv_done = False  # True when recv was done during overlap window
+        _overlap_recv_reqs = []  # Buffered recv results from overlap
+        _deferred_stream_batch = None  # Deferred stream_output from previous step
+
+        # Detailed per-phase timing (collected every N steps, logged periodically)
+        _phase_times = {
+            'recv': [], 'filter': [], 'absorb': [],
+            'prep': [], 'get_batch': [], 'forward_call': [],
+            'process': [], 'staging': [], 'total': [],
+        }
+        _PROFILE_INTERVAL = 500  # Log every N steps
+
+        try:
+            while True:
+                _t0 = time.perf_counter()
+                if not _recv_done:
+                    recv_reqs = self.recv_requests()
+                    if recv_reqs:
+                        self.process_input_requests(recv_reqs)
+                else:
+                    # Already received during overlap — process buffered results
+                    if _overlap_recv_reqs:
+                        self.process_input_requests(_overlap_recv_reqs)
+                    _recv_done = False
+                    _overlap_recv_reqs = []
+                _ta = time.perf_counter()
+                _t_recv += (_ta - _t0)
+
+                # Handle finished requests FIRST (batch tensors still consistent)
+                if any(r.finished() for r in batch.reqs):
+                    self.dllm_manager.staging_queue = [
+                        r for r in self.dllm_manager.staging_queue
+                        if not r.finished()
+                    ]
+                    batch.output_ids = None
+                    batch.filter_batch()
+                    if batch.is_empty():
+                        exit_reason = "all_finished"
+                        break
+                _tb = time.perf_counter()
+                _t_filter += (_tb - _ta)
+
+                # Inline absorb new requests AFTER filter
+                # (prepare_for_dllm_decode rebuilds all tensors from scratch)
+                if self.waiting_queue:
+                    self._inline_absorb_new_requests(batch)
+                    _n_absorb += 1
+                _tc = time.perf_counter()
+                _t_absorb += (_tc - _tb)
+                _t1 = _tc
+                _t_sched += (_t1 - _t0)
+
+                # Lightweight batch prep
+                success = batch.prepare_for_dllm_decode()
+                if not success:
+                    exit_reason = "alloc_failed"
+                    break
+                _t2 = time.perf_counter()
+                _t_prep += (_t2 - _t1)
+
+                # Forward with overlap: process(N-1) + prep(N+1) during GPU compute
+                self.cur_batch = batch
+                self.forward_ct += 1
+                self._profile_batch_predicate(batch)
+                _t2a = time.perf_counter()
+                model_worker_batch = batch.get_model_worker_batch()
+                _t2b = time.perf_counter()
+
+                def _overlap_fn():
+                    nonlocal _recv_done, _overlap_recv_reqs, _deferred_stream_batch
+                    # Deferred stream_output from previous step (hidden behind GPU compute)
+                    if _deferred_stream_batch is not None:
+                        _reqs, _return_logprob = _deferred_stream_batch
+                        self.stream_output(_reqs, _return_logprob)
+                        _deferred_stream_batch = None
+                    _overlap_recv_reqs = self.recv_requests()
+                    _recv_done = True
+
+                model_worker_batch._dllm_overlap_fn = _overlap_fn
+                with self.record_forward_metrics(batch):
+                    result = self.model_worker.forward_batch_generation(
+                        model_worker_batch
+                    )
+                batch.output_ids = result.next_token_ids
+
+                _t3 = time.perf_counter()
+                _t_forward += (_t3 - _t2)
+
+                # Critical-path process: KV free + state update + finished check
+                # (stream_output is deferred to next step's overlap window)
+                self._process_dllm_critical_inline(batch, result)
+                # Snapshot reqs+flag for deferred stream (batch is mutated by filter_batch)
+                _deferred_stream_batch = (list(batch.reqs), batch.return_logprob)
+                _t4 = time.perf_counter()
+                _t_process += (_t4 - _t3)
+
+                self.dllm_manager.staging_queue = [
+                    r for r in batch.reqs if not r.finished()
+                ]
+                _t5 = time.perf_counter()
+                self.last_batch = batch
+
+                # Collect per-phase times
+                _phase_times['recv'].append(_ta - _t0)
+                _phase_times['filter'].append(_tb - _ta)
+                _phase_times['absorb'].append(_tc - _tb)
+                _phase_times['prep'].append(_t2 - _t1)
+                _phase_times['get_batch'].append(_t2b - _t2a)
+                _phase_times['forward_call'].append(_t3 - _t2b)
+                _phase_times['process'].append(_t4 - _t3)
+                _phase_times['staging'].append(_t5 - _t4)
+                _phase_times['total'].append(_t5 - _t0)
+
+                if len(_phase_times['total']) % _PROFILE_INTERVAL == 0:
+                    n = len(_phase_times['total'])
+                    parts = []
+                    for k in ['recv', 'filter', 'absorb', 'prep', 'get_batch', 'forward_call', 'process', 'staging']:
+                        avg_us = sum(_phase_times[k][-_PROFILE_INTERVAL:]) / _PROFILE_INTERVAL * 1e6
+                        parts.append(f"{k}={avg_us:.0f}")
+                    avg_total = sum(_phase_times['total'][-_PROFILE_INTERVAL:]) / _PROFILE_INTERVAL * 1e6
+                    logger.info(
+                        f"[DLLM step profile] step={avg_total:.0f}us bs={len(batch.reqs)} "
+                        + " ".join(parts)
+                    )
+                steps += 1
+        except Exception as e:
+            exit_reason = f"exception: {e}"
+            logger.error(f"[DLLM decode loop] exception after {steps} steps: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Flush deferred stream_output before exiting
+        if _deferred_stream_batch is not None:
+            _reqs, _return_logprob = _deferred_stream_batch
+            self.stream_output(_reqs, _return_logprob)
+            _deferred_stream_batch = None
+
+        batch._dllm_decode_mode = False
+
+        # Flush cache_unfinished_req for all unfinished requests — skipped
+        # during the fast decode loop to avoid GPU tensor copies per step.
+        for req in batch.reqs:
+            if not req.finished():
+                self.tree_cache.cache_unfinished_req(req)
+
+        # Ensure all unfinished batch requests are in dllm_manager.waiting_queue
+        # so the outer scheduler can re-schedule them. Inline-absorbed requests
+        # bypass _fetch_waiting_reqs and need to be registered here.
+        existing_rids = {r.rid for r in self.dllm_manager.waiting_queue}
+        for req in batch.reqs:
+            if not req.finished() and req.rid not in existing_rids:
+                self.dllm_manager.waiting_queue.append(req)
+
+        if steps > 0:
+            total_t = _t_sched + _t_prep + _t_forward + _t_process
+            logger.info(
+                f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}, "
+                f"total={total_t*1000:.0f}ms "
+                f"(sched={_t_sched/total_t*100:.0f}% "
+                f"[recv={_t_recv*1000:.0f}ms filter={_t_filter*1000:.0f}ms "
+                f"absorb={_t_absorb*1000:.0f}ms/{_n_absorb}calls] "
+                f"prep={_t_prep/total_t*100:.0f}% "
+                f"fwd={_t_forward/total_t*100:.0f}% "
+                f"proc={_t_process/total_t*100:.0f}%) "
+                f"step={total_t/steps*1000:.1f}ms"
+            )
+
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -1117,6 +1458,18 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+
+                # DLLM: enter fast decode loop after first decode step
+                # (not after prefill — one-shot prefill returns no tokens)
+                # Allow entry even with waiting_queue: inline absorption
+                # handles new requests inside the decode loop.
+                if (self.dllm_config is not None
+                    and self.dllm_manager.any_staging_reqs()
+                    and not any(r.finished() for r in batch.reqs)
+                    and not any(r.is_dllm_prefill() for r in batch.reqs)):
+                    self.last_batch = batch
+                    self._dllm_decode_loop(batch)
+                    continue  # Re-enter outer loop for scheduling
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1886,8 +2239,8 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+            # Skip stash (cache_unfinished_req) — already done by process_batch_result_dllm.
+            # The prefix_indices are up-to-date from the last decode step.
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge

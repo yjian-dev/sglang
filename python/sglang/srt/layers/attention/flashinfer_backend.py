@@ -99,6 +99,8 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
+    dllm_is_prefill: bool = False
+    dllm_force_causal: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -132,6 +134,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        # For SDAR-style models: use causal attention during STAGING_PREFILL
+        self.dllm_causal_prefill = (
+            self.dllm_config.causal_prefill if self.dllm_config is not None else False
+        )
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -465,6 +471,35 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
             )
+        elif (
+            forward_batch.forward_mode.is_dllm_extend()
+            and self.is_dllm_model
+            and (forward_batch.input_ids == self.dllm_config.mask_id).any().item()
+        ):
+            # DLLM decode (has MASK): paged-only attention.
+            # Pure prefill (no MASK) falls through to general extend path
+            # which uses ragged-only (faster, no page table lookup).
+            dllm_force_causal = getattr(
+                forward_batch, "dllm_force_causal", False
+            )
+            prefix_lens = forward_batch.extend_prefix_lens
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens=prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=None,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
+                False,
+                False,
+                dllm_force_causal=dllm_force_causal,
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -501,11 +536,36 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
             )
+            # For SDAR-style dLLM models with causal_prefill: detect whether
+            # this extend batch is a STAGING_PREFILL (no mask tokens in input).
+            # Multi-block prefill with a prefix enters the cascade branch
+            # (extend_no_prefix=False) and needs causal attention.
+            # The commit pass (after denoising, also no mask tokens) signals
+            # dllm_is_commit=True to force bidirectional attention.
+            dllm_is_prefill = False
+            if (
+                self.dllm_causal_prefill
+                and forward_batch.forward_mode.is_dllm_extend()
+            ):
+                is_commit = getattr(forward_batch, "dllm_is_commit", False)
+                if is_commit:
+                    dllm_is_prefill = False  # commit → bidirectional
+                else:
+                    dllm_is_prefill = not (
+                        forward_batch.input_ids == self.dllm_config.mask_id
+                    ).any().item()
+
+            dllm_force_causal = getattr(
+                forward_batch, "dllm_force_causal", False
+            )
+
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
+                dllm_is_prefill=dllm_is_prefill,
+                dllm_force_causal=dllm_force_causal,
             )
 
     def init_cuda_graph_state(
@@ -671,12 +731,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
+                use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -728,14 +788,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            # Original path — negative prefix_lens for padded entries is OK
+            # (flashinfer handles it correctly; the qo_indptr caching bug was separate)
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=seq_lens[:bs] - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=True,
+                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
@@ -815,6 +877,18 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            # For SDAR-style dLLM models with causal_prefill=True:
+            # STAGING_PREFILL (extend_no_prefix=True) must use causal attention
+            # to match training where prompt (x0) tokens attend causally.
+            # STAGING_DECODE (extend_no_prefix=False, DLLM_EXTEND) keeps
+            # bidirectional (causal=False) for the current block.
+            if (
+                self.dllm_causal_prefill
+                and layer.attn_type == AttentionType.ENCODER_ONLY
+                and self.forward_metadata.extend_no_prefix
+            ):
+                causal = True
+
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
@@ -832,6 +906,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 if not self.is_dllm_model:
                     # TODO: design a better interface
                     # For other models, use causal attention for the ragged part as previously
+                    causal = True
+                elif (
+                    self.dllm_causal_prefill
+                    and layer.attn_type == AttentionType.ENCODER_ONLY
+                    and self.forward_metadata.dllm_is_prefill
+                ):
+                    # SDAR-style causal_prefill: multi-block STAGING_PREFILL
+                    # needs causal attention for the ragged (new-token) part.
+                    # Commit passes are signaled by injecting a mask token,
+                    # so dllm_is_prefill=False and this branch is skipped.
+                    causal = True
+                elif self.forward_metadata.dllm_force_causal:
+                    # DreamShiftBlock2: force causal within block so that
+                    # token_0 does not attend to MASK at position 1.
                     causal = True
 
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -1372,11 +1460,18 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
+            # Reuse kv_indices buffer to avoid per-step allocation
+            needed = paged_kernel_lens_sum + 256
+            _kv_buf = getattr(self, '_kv_indices_buf', None)
+            if _kv_buf is not None and _kv_buf.shape[0] >= needed:
+                kv_indices = _kv_buf
+            else:
+                kv_indices = torch.empty(
+                    max(needed, 8192),  # over-allocate for growth
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                self._kv_indices_buf = kv_indices
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,

@@ -30,32 +30,23 @@ class SchedulerDllmMixin:
         if self.try_preemption:
             self.running_batch.batch_is_full = False
 
-        # Early exit if batch is full or no requests available
         if self._should_skip_prefill():
             return None
 
         running_bs = len(self.running_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
-
-        # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs)
 
-        # Initialize DLLM manager and transfer requests
         self.dllm_manager.init_next_round()
         self._fetch_waiting_reqs()
 
-        # Process batches
         forward_mode = self._process_dllm_batches(adder)
-
         can_run_list = adder.can_run_list
         if not can_run_list:
             return None
 
-        # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
         self._update_state_for_batch(can_run_list, adder, running_bs)
-
-        # Create and prepare batch
         new_batch = self._create_dllm_batch(can_run_list, forward_mode)
         return new_batch
 
@@ -64,7 +55,9 @@ class SchedulerDllmMixin:
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
             self.dllm_manager.waiting_queue
         )
-        num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
+        # Also limit by available req pool slots (staging reqs already hold slots)
+        req_pool_avail = self.req_to_token_pool.available_size()
+        num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue), req_pool_avail)
 
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
@@ -106,27 +99,35 @@ class SchedulerDllmMixin:
         )
 
     def _process_dllm_batches(self: Scheduler, adder: PrefillAdder) -> ForwardMode:
-        """Process prefill or decode batches for DLLM."""
+        """Process prefill or decode batches for DLLM.
+
+        Original prefill-first policy but with one-shot prefill:
+        each new request completes prefill in 1 round, then joins
+        the decode batch. This naturally builds up batch size.
+        """
         forward_mode = ForwardMode.DLLM_EXTEND
 
-        # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
             self._process_batch_by_phase(
-                adder,
-                prefill_reqs,
-                DllmReqPhase.STAGING_PREFILL,
-                DllmReqPhase.INCOMING_PREFILL,
+                adder, prefill_reqs,
+                DllmReqPhase.STAGING_PREFILL, DllmReqPhase.INCOMING_PREFILL,
             )
         else:
-            # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
             self._process_batch_by_phase(
-                adder,
-                decode_reqs,
-                DllmReqPhase.STAGING_DECODE,
-                DllmReqPhase.INCOMING_DECODE,
+                adder, decode_reqs,
+                DllmReqPhase.STAGING_DECODE, DllmReqPhase.INCOMING_DECODE,
             )
+
+        # Safety guard
+        if adder.can_run_list:
+            has_prefill = any(req.is_dllm_prefill() for req in adder.can_run_list)
+            has_decode = any(not req.is_dllm_prefill() for req in adder.can_run_list)
+            if has_prefill and has_decode:
+                adder.can_run_list = [
+                    req for req in adder.can_run_list if req.is_dllm_prefill()
+                ]
 
         return forward_mode
 
@@ -221,7 +222,6 @@ class SchedulerDllmMixin:
                 has_chunked_req=True,
                 truncation_align_size=self.truncation_align_size,
             )
-
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.running_batch.batch_is_full = True

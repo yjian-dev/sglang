@@ -525,6 +525,17 @@ class CudaGraphRunner:
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
+            # For DLLM + cuBLAS: pre-load the first LoRA adapter into GPU memory
+            # so we can capture cuBLAS ops with real weight pointers.
+            lora_mgr = self.model_runner.lora_manager
+            self._cublas_lora_uid = None
+            if self.is_dllm and lora_mgr.loras:
+                uid = next(iter(lora_mgr.loras.keys()))
+                lora_mgr.fetch_new_loras(new_loras={uid})
+                self._cublas_lora_uid = uid
+                logger.info(
+                    f"Pre-loaded LoRA adapter '{uid}' for cuBLAS CUDA graph capture"
+                )
 
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -638,12 +649,22 @@ class CudaGraphRunner:
             else True
         )
 
+        is_dllm_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.is_dllm
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dllm_supported
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -733,6 +754,14 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
+        # Mark cuBLAS graph as captured so prepare_lora_batch can be skipped.
+        # Reset _cublas_mode so non-graph forwards (server warmup) don't use cuBLAS path.
+        if getattr(self, '_cublas_lora_uid', None) is not None:
+            lora_backend = self.model_runner.lora_manager.lora_backend
+            lora_backend.cublas_graph_captured = True
+            lora_backend._cublas_mode = False
+            logger.info("cuBLAS LoRA ops captured in CUDA graph")
+
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.model_runner.server_args.enable_memory_saver
@@ -821,9 +850,14 @@ class CudaGraphRunner:
             )
 
         if self.model_runner.server_args.enable_lora:
-            # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
-            # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
-            lora_ids = [None] * bs
+            # For DLLM + cuBLAS: use real LoRA adapter ID so cuBLAS mm/addmm_ ops
+            # are captured with real weight pointers (2-3x faster than csgmv).
+            cublas_uid = getattr(self, '_cublas_lora_uid', None)
+            if cublas_uid is not None:
+                lora_ids = [cublas_uid] * bs
+            else:
+                # Fallback: capture with empty LoRA IDs (csgmv no-op path).
+                lora_ids = [None] * bs
         else:
             lora_ids = None
 
@@ -877,6 +911,14 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+        # Set extend fields for DLLM_EXTEND mode (needed by LoRA segment length computation)
+        if self.capture_forward_mode.is_dllm_extend():
+            _tpb = self.num_tokens_per_bs
+            forward_batch.extend_seq_lens = torch.full(
+                (bs,), _tpb, dtype=torch.int32, device=input_ids.device
+            )
+            forward_batch.extend_seq_lens_cpu = [_tpb] * bs
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
@@ -970,11 +1012,144 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def replay_prepare_early(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """Early metadata preparation: attention backend + seq_lens + positions.
+        Can be called before input_ids are finalized (e.g., during overlap window).
+        Only updates metadata that doesn't depend on input_ids content."""
+        buffers = self.buffers
+        self.recapture_if_needed(forward_batch)
+
+        raw_bs = forward_batch.batch_size
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                else max_num_tokens
+            )
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+
+        # Copy seq_lens, positions, req_pool_indices (don't depend on input_ids)
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens[:raw_bs])
+        if raw_bs < bs:
+            buffers.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+        if hasattr(buffers, 'seq_lens_cpu') and forward_batch.seq_lens_cpu is not None:
+            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
+            if raw_bs < bs:
+                buffers.seq_lens_cpu[raw_bs:bs].fill_(self.seq_len_fill_value)
+        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices[:raw_bs])
+        if forward_batch.positions is not None:
+            buffers.positions[:raw_num_token].copy_(forward_batch.positions[:raw_num_token])
+        if forward_batch.out_cache_loc is not None:
+            buffers.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc[:raw_num_token])
+
+        # Attention backend metadata (the expensive part: ~0.43ms)
+        if self.enable_pdmux:
+            stream_idx = get_current_stream_idx()
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+        else:
+            attn_backend = self.model_runner.attn_backend
+        attn_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            buffers.req_pool_indices[:bs],
+            buffers.seq_lens[:bs],
+            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+            self.capture_forward_mode,
+            forward_batch.spec_info,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        )
+
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+        self._early_prepared = True
+
+    def replay_prepare_late(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        """Late preparation: copy input_ids into CUDA graph buffers.
+        Must be called after input_ids are finalized by classify."""
+        buffers = self.buffers
+        # Only copy input_ids (the content that classify changes)
+        buffers.input_ids[:self.raw_num_token].copy_(forward_batch.input_ids[:self.raw_num_token])
+        self._early_prepared = False
+
+    def init_dllm_metadata_early(self, forward_batch: ForwardBatch) -> bool:
+        """DLLM optimization: init flashinfer metadata BEFORE classify phase.
+
+        Called by the DLLM algorithm before filling input_ids, so the async
+        GPU plan (flashinfer begin_forward, non_blocking=True) can run during
+        the CPU-side classify loop (~190us overlap).
+
+        Returns True if early init succeeded and replay_prepare should skip
+        the metadata step.
+        """
+        if not forward_batch.forward_mode.is_dllm_extend():
+            return False
+        try:
+            raw_bs = forward_batch.batch_size
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+            bs = self.capture_bs[index]
+            attn_backend = self.model_runner.attn_backend
+            seq_lens_sum_padded = (
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+            )
+            # Need padded tensors matching the capture bs
+            buffers = self.buffers
+            # Copy real seq_lens to buffers first (replicate what populate does for these fields)
+            buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            if raw_bs < bs:
+                buffers.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+            buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            if raw_bs < bs:
+                buffers.req_pool_indices[raw_bs:bs].fill_(0)
+            # seq_lens_cpu: just extend with fill value
+            if forward_batch.seq_lens_cpu is not None:
+                sl_cpu = forward_batch.seq_lens_cpu
+                if raw_bs < bs:
+                    import torch as _torch
+                    pad = _torch.full((bs - raw_bs,), self.seq_len_fill_value, dtype=sl_cpu.dtype)
+                    sl_cpu_padded = _torch.cat([sl_cpu, pad])
+                else:
+                    sl_cpu_padded = sl_cpu
+            else:
+                sl_cpu_padded = None
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                seq_lens_sum_padded,
+                None,  # encoder_lens not used by DLLM
+                self.capture_forward_mode,
+                None,  # spec_info not used by DLLM
+                seq_lens_cpu=sl_cpu_padded[:bs] if sl_cpu_padded is not None else None,
+            )
+            self._dllm_metadata_pre_initialized = True
+            self._dllm_early_bs = bs
+            self._dllm_early_raw_bs = raw_bs
+            return True
+        except Exception:
+            self._dllm_metadata_pre_initialized = False
+            return False
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        """Full preparation (non-pipelined path)."""
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
 
@@ -1019,26 +1194,31 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.model_runner.attn_backend
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
+        # Skip if DLLM pre-initialized metadata early (before classify) for overlap
+        _skip_metadata = getattr(self, '_dllm_metadata_pre_initialized', False)
+        self._dllm_metadata_pre_initialized = False  # consume the flag
+        if not _skip_metadata:
+            if self.enable_pdmux:
+                stream_idx = get_current_stream_idx()
+                attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+            else:
+                attn_backend = self.model_runner.attn_backend
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            )
 
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self._early_prepared = False
 
     def replay(
         self,
