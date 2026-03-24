@@ -1,0 +1,113 @@
+    
+\documentclass{article} % For LaTeX2e
+\usepackage[submission]{colm2026_conference}
+
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{pifont}
+\usepackage{tikz}
+\usepackage{lineno}
+
+\usepackage{enumitem}
+\newenvironment{denseitemize}{
+\begin{itemize}[topsep=2.5pt, partopsep=0pt, leftmargin=1.5em]
+  \setlength{\itemsep}{2.5pt}
+  \setlength{\parskip}{0pt}
+  \setlength{\parsep}{0pt}
+}{\end{itemize}}
+
+
+\providecommand{\chenfeng}[1]{{\color{cyan}{/* chenfeng: #1 */}}}
+\newcommand{\fan}[1]{\textcolor{blue}{[Fan: #1]}}
+\newcommand{\yifan}[1]{\textcolor{orange}{[Yifan: #1]}}
+
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\input{math_commands.tex}
+
+\title{Introspective Strided Diffusion Language Models}
+
+
+\author{}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\begin{document}
+
+\ifcolmsubmission
+\linenumbers
+\fi
+
+\maketitle
+
+
+% \chenfeng{这些insight 我觉得需要放进paper 里：
+% Compared AR, DLLM is really attractive of its parallel decoding capability. Despite this appealing advantage, why dllm is still not widely adopted by industry/practical applications? 
+% 我们这里需要point out 出四个点：
+% 1. Infra：现在的AI infra还没有ready for DLLM，主要为aR 设计的AI infra 并不适用于diffusion 的parallel decoding，其中包括attention kernel, scheduling, batching, pipelining strategy
+
+% 2. The cost of parallel decoding pay is far more than the benefit: parallel decoding 确实是能在小throughput, 低latency 的field work的很好 比如可以cite mercury 或其他比如tidar 极致latency，但是他带来的代价是用了大量的compute 去trade 更多的parallel decoding， 比如20x more compute to decode 8 tokens etc.. 这个买卖其实并不划算，这导致在cloud services (cite together ai) 追求极致大吞吐的商业场景 dllm甚至远远不如AR。（比较大concurrency 场景）
+
+% 3. 现在diffusion LLM的accuracy 远远不如 AR，这个acc的gap 的一个重要原因是 train DLLM 的cost 其实是非常高的，这个cost 包括两个，data的cost 和 compute的cost，对于data，LLADA 训练了xx tokens 只达到了xxx acc，sdar/dream等工作从AR 出发想要省data 也得需要50B的token 却也只拿到了xxx acc. training 的compute cost 的帐可以再算一下：AR 的training 是每个token 对应的flops/query 都会被train到：但是dllm 不是，考虑到那个2*2 的mask size （tidar） 甚至用的更多以及*mask ratio，每个training flops/query 其实远远不如AR，这导致diffusion LLM的training 是远远不如AR scalabel的。
+
+% 4. 现在diffusion LLM的accurac 远远不如AR的另一个原因是prefill 和decoding 的mismatch，AR model的causal mask 能够同时做好decode 和 prefill，但是diffusion model 的block causal mask 并不行 （可以show出 我们的结果）
+
+% 基于AI infra customized for AR, cost of parallel decoding compared to AR, accuracy gap to ar, training gap to ar, prefilling-decoding mismatch compared to AR，我们站在跟之前工作不太一样的角度，不是像fastdllmv1,v2 或dllm-cache 等等一系列工作让diffusion closed to AR, 我们这次站在AR的角度，borrow diffusionllm的insight 让他更parallel decoding。
+
+% 这个insight 也并不新，比如很多人都做了比如MTP，register AR, etc. 我们更好的trade 了compute 和 parallel decoding，（直接拿结果比）
+% }
+
+% \chenfeng{
+% These should put into the paper:
+
+% Compared with autoregressive (AR) models, diffusion LLMs (DLLMs) are highly attractive because of their ability to decode multiple tokens in parallel. In principle, this offers a compelling path to lower latency and higher hardware utilization. Yet despite this appeal, DLLMs have still not been widely adopted in industry or practical deployment. Why?
+% We argue that the answer lies in four major gaps between the theoretical promise of DLLMs and the realities of modern LLM systems.
+
+% First, today’s AI infrastructure is still fundamentally optimized for AR decoding rather than diffusion-style parallel generation. The entire serving stack—from attention kernels to runtime scheduling, batching policies, and pipelining strategies—has been designed around the sequential structure of AR models. As a result, existing infrastructure does not naturally support the decoding patterns required by DLLMs, and the systems overhead of adapting it can be substantial.
+
+% Second, the compute cost of parallel decoding often outweighs its latency benefit. Parallel decoding can indeed work well in low-throughput, latency-critical regimes, as shown by systems targeting extremely low-latency generation. However, this speedup is typically purchased with a large increase in total compute. In many cases, a model may spend dramatically more FLOPs to decode only a small number of tokens in parallel. This trade-off is often unattractive in commercial cloud settings, where the dominant objective is not single-request latency but high overall throughput under large concurrency. In such environments, the extra compute required by DLLMs can make them significantly less cost-effective than AR models.
+
+% Third, DLLMs still lag substantially behind AR models in accuracy, and a major reason is that training DLLMs is fundamentally more expensive and less scalable. This disadvantage arises on two fronts: data cost and compute cost. On the data side, existing DLLM training pipelines require enormous token budgets yet still fall short of AR-level performance. On the compute side, AR training uses each token prediction directly and efficiently: every token contributes a clear next-token learning signal. In contrast, DLLM training only partially supervises each example through masking and denoising objectives, so the effective training signal per unit FLOPs is much weaker. Put differently, the amount of useful supervision extracted per training computation is significantly lower than in AR training. This makes DLLMs much less scalable from a training-efficiency perspective.
+
+% Fourth, DLLMs suffer from a fundamental mismatch between prefilling and decoding. AR models use a single causal masking structure that naturally supports both prefill and next-token decoding. Diffusion-style models, however, typically rely on blockwise or non-causal masking schemes that do not align as cleanly with the decoding regime used at inference time. This mismatch creates an additional accuracy gap relative to AR models, because the model is not trained and deployed under as unified a formulation as AR.
+% Taken together, these factors suggest that the current limitations of DLLMs are not due to a lack of interest in parallel decoding itself. Rather, they reflect a broader systems and modeling reality: today’s infrastructure is built for AR, the compute economics of diffusion decoding are often unfavorable, and the training and inference paradigms of DLLMs remain less scalable and less aligned than those of AR models.
+
+% Our perspective therefore differs from prior work such as Fast-DLLM, DLLM-Cache, and related efforts, which aim to push diffusion LLMs closer to AR performance and practicality. Instead, we take the opposite viewpoint: rather than adapting the ecosystem to diffusion, we start from the AR side and ask what useful ideas can be borrowed from diffusion models to make AR decoding more parallel.
+
+% This perspective is not entirely new. Many existing lines of work—including multi-token prediction (MTP), register-based AR variants, and related approaches—can be seen as attempts to inject more parallelism into AR decoding. Our goal is to push this direction further by achieving a better trade-off between compute cost and decoding parallelism, while preserving the accuracy, scalability, and infrastructure compatibility of AR models}
+\begin{abstract}
+Diffusion language models (DLLMs) promise faster generation through parallel decoding, but existing approaches suffer from poor output quality, incompatible infrastructure, and unfavorable compute economics at scale.
+We introduce \textbf{Strided DLLM}, a flexible diffusion model that decodes at any stride from 1 (exact AR) to $N$ (parallel diffusion) while preserving the pretrained AR model's causal attention, next-token prediction objective, and serving infrastructure.
+Our key insight is a \emph{unified verify-and-decode training} recipe: by combining causal attention with logit shift, every position---masked or clean---is trained with the same next-token cross-entropy loss, equipping the model with both a decode distribution $q$ and a verify distribution $p$.
+At inference, \emph{Introspective Strided Decoding} (ISD) uses the $p/q$ acceptance criterion to adaptively accept or correct parallel proposals, provably preserving the base AR distribution without confidence thresholds.
+For lossless acceleration, we gate a LoRA residual per token so that verification positions use base-only weights, yielding bit-for-bit identical output to the AR model.
+We integrate ISD directly into SGLang's AR serving stack through a stationary-batch decode loop, CUDA graph capture for multi-token extend, and fused Triton verification kernels.
+Strided DLLM-8B (converted from Qwen3-8B) matches AR quality on 12 benchmarks (96.0\% GSM8K, 93.9\% HumanEval, 84.7\% IFEval), achieves 2.1$\times$ the per-request throughput of AR at batch size 1, and sustains higher throughput than both AR and EAGLE-3 through batch size 64 on a single H100.
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/motivation}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/analysis}
+\input{sections/conclusion}
+
+% \section*{Acknowledgments}
+
+\bibliography{colm2026_conference}
+\bibliographystyle{colm2026_conference}
+
+\input{sections/appendix}
+
+\end{document}

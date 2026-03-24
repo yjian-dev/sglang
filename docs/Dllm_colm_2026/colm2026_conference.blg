@@ -1,0 +1,51 @@
+This is BibTeX, Version 0.99d (TeX Live 2022/dev/Debian)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: colm2026_conference.aux
+The style file: colm2026_conference.bst
+Database file #1: colm2026_conference.bib
+Warning--I didn't find a database entry for "llada2025"
+Warning--I didn't find a database entry for "llada21_2025"
+Warning--empty booktitle in chen2023speculative
+Warning--empty journal in eagle2024
+You've used 41 entries,
+            2773 wiz_defined-function locations,
+            758 strings with 11785 characters,
+and the built_in function-call counts, 18437 in all, are:
+= -- 1481
+> -- 1483
+< -- 24
++ -- 508
+- -- 462
+* -- 1430
+:= -- 3035
+add.period$ -- 123
+call.type$ -- 41
+change.case$ -- 257
+chr.to.int$ -- 36
+cite$ -- 84
+duplicate$ -- 820
+empty$ -- 1307
+format.name$ -- 524
+if$ -- 3751
+int.to.chr$ -- 6
+int.to.str$ -- 1
+missing$ -- 41
+newline$ -- 213
+num.names$ -- 164
+pop$ -- 559
+preamble$ -- 1
+purify$ -- 216
+quote$ -- 0
+skip$ -- 657
+stack$ -- 0
+substring$ -- 82
+swap$ -- 55
+text.length$ -- 1
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 451
+warning$ -- 2
+while$ -- 123
+width$ -- 0
+write$ -- 499
+(There were 4 warnings)

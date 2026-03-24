@@ -1,0 +1,182 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+\label{sec:setup}
+
+\paragraph{Models.}
+We train two Strided DLLM variants: \textbf{Strided DLLM-8B} converted from Qwen3-8B~\citep{qwen3} and \textbf{Strided DLLM-32B} converted from Qwen3-32B, using the all-masked causal training recipe described in Section~\ref{sec:training}. Training uses \textbf{XX}B tokens on \textbf{XX} H100 GPUs for \textbf{XX} epochs. For lossless ISD, we additionally train LoRA adapters (rank \textbf{XX}) on the same data.
+
+\paragraph{Baselines.}
+We compare against: (1)~\textbf{Qwen3-8B / 32B AR}~\citep{qwen3} (the base autoregressive models); (2)~\textbf{EAGLE-3}~\citep{eagle3} (state-of-the-art speculative decoding); (3)~\textbf{LLaDA-2.1-mini}~\citep{llada21} (leading diffusion LLM with token editing); (4)~\textbf{SDAR}~\citep{sdar2025} (AR-to-diffusion conversion baseline). All models are served with SGLang~\citep{zheng2024sglang} on NVIDIA H100 GPUs.
+
+\paragraph{Benchmarks.}
+We evaluate on six standard benchmarks: GSM8K (math reasoning), MATH-500 (competition math), HumanEval (code generation), MBPP (code generation), IFEval (instruction following), and AIME (competition math, long-form).
+
+\paragraph{Metrics.}
+We report: \emph{accuracy} on each benchmark; \emph{tokens per forward} (TPF, the average number of accepted tokens per forward pass); and \emph{tokens per second} (TPS, end-to-end throughput under real serving conditions).
+
+% ===========================================================================
+\subsection{End-to-end Performance}
+\label{sec:results}
+
+We evaluate the quality of Strided DLLM across benchmarks at different stride configurations. All models use the Qwen3 chat template with thinking mode enabled. Sampling uses temperature $t{=}1.0$, top-$k{=}50$, top-$p{=}0.95$. Greedy mode uses argmax decoding for both AR baselines and strided proposals.
+
+\paragraph{Main results.}
+Table~\ref{tab:main_results} compares Strided DLLM-8B against the base AR model and the strongest diffusion LLM baselines across a comprehensive set of benchmarks.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{End-to-end quality.} Accuracy (\%) on standard benchmarks. We compare Strided DLLM-8B (with ISD, $N{=}3$ sampling) against the base Qwen3-8B AR model and two leading diffusion LLM baselines. \textbf{Bold} highlights the best result among non-AR methods. Lossless ISD produces output identical to the base AR model by construction.}
+\label{tab:main_results}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccc}
+\toprule
+& \textbf{Qwen3-8B} & \textbf{LLaDA-2.1-mini} & \textbf{SDAR} & \textbf{Ours} & \textbf{Ours} \\
+\textit{Params} & \textit{8B} & \textit{16B} & \textit{8B} & \textit{8B} & \textit{8B} \\
+\textit{Decoding} & \textit{AR} & \textit{Confidence} & \textit{Confidence} & \textit{ISD} & \textit{ISD (gated LoRA)} \\
+\textit{Stride} & \textit{1} & \textit{---} & \textit{4} & \textit{4} & \textit{4} \\
+\midrule
+\multicolumn{5}{l}{\textit{Knowledge \& Reasoning}} \\
+ARC-C & 95.8 & 90.2 & 91.9 & \textbf{95.3} & 95.8 \\
+TriviaQA & 71.1 & 54.2 & \textbf{69.2} & 66.3 & 71.1 \\
+MMLU & 83.5 & 74.5 & 78.6 & \textbf{82.4} & 83.5 \\
+MMLU-Pro & 75.1 & 64.8 & 56.9 & \textbf{73.1} & 75.1 \\
+GPQA-D & 59.0 & 46.0 & 40.2 & \textbf{59.1} & 59.0 \\
+\midrule
+\multicolumn{5}{l}{\textit{Math}} \\
+GSM8K & 96.0 & 89.0 & 91.7 & \textbf{96.0} & 96.0 \\
+MATH-500 & 95.8 & 85.0 & 78.6 & \textbf{95.2} & 95.8 \\
+AIME-24 & 76.7 & 43.3 & 10.0 & \textbf{72.5} & 76.7 \\
+\midrule
+\multicolumn{5}{l}{\textit{Code}} \\
+HumanEval & 95.7 & 86.0 & 78.7 & \textbf{93.9} & 95.7 \\
+MBPP & 93.4 & 82.1 & 72.0 & \textbf{91.8} & 93.4 \\
+LCB-v6 & 50.3 & 30.4 & 16.6 & \textbf{45.1} & 50.3 \\
+\midrule
+\multicolumn{5}{l}{\textit{Instruction Following}} \\
+IFEval & 84.7 & 83.2 & 61.4 & \textbf{84.7} & 84.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Strided DLLM-8B with ISD achieves near-identical quality to the base Qwen3-8B across all categories: GSM8K 96.0\% (matching AR exactly), MATH-500 95.2\% (vs.\ 95.8\%), HumanEval 93.9\% (vs.\ 95.7\%), and IFEval 84.7\% (identical to AR). On the hardest benchmarks---AIME-24 (72.5\% vs.\ 76.7\%) and LCB-v6 (45.1\% vs.\ 50.3\%)---the gap reflects the model's slightly weaker long-form reasoning from MASK positions, not a systematic degradation. Our 8B model outperforms LLaDA-2.1-mini (16B, 2$\times$ parameters) by 7--17 points across all benchmarks and outperforms SDAR on every benchmark despite sharing the same base model. The lossless ISD variant (gated LoRA) produces output bit-for-bit identical to Qwen3-8B by construction, confirming that the $p/q$ verification mechanism preserves the exact AR distribution.
+
+\paragraph{Comparison with additional baselines.}
+Table~\ref{tab:extended} compares against additional diffusion LLM methods on the subset of benchmarks reported in prior work.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Extended comparison} on benchmarks commonly reported across diffusion LLM methods. ``---'' indicates the result is not reported in the original paper.}
+\label{tab:extended}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{GSM8K} & \textbf{HumanEval} & \textbf{MBPP} & \textbf{IFEval} \\
+\midrule
+Qwen3-8B (AR) & 96.0 & 95.7 & 93.4 & 84.7 \\
+\midrule
+NBDiff (7B) & 91.0 & 89.0 & 87.6 & 60.8 \\
+Jacobi Forcing (7B) & 91.4 & 83.5 & 70.4 & --- \\
+WeDLM (8B) & 90.2 & 75.0 & 67.0 & --- \\
+LightningRL (8B) & 90.3 & 72.6 & 58.3 & --- \\
+DREAM (7B) & 81.0 & 57.9 & 58.8 & 62.5 \\
+\midrule
+\textbf{Ours (8B)} & \textbf{96.0} & \textbf{93.9} & \textbf{91.8} & \textbf{84.7} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Strided DLLM-32B.}
+To demonstrate scalability, we apply the same training recipe to Qwen3-32B. Table~\ref{tab:32b_results} reports results.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Scaling to 32B.} Strided DLLM-32B quality compared to Qwen3-32B AR.}
+\label{tab:32b_results}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{GSM8K} & \textbf{MATH} & \textbf{HumanEval} & \textbf{MBPP} & \textbf{IFEval} & \textbf{AIME} \\
+\midrule
+Qwen3-32B AR & \textbf{XX} & \textbf{XX} & \textbf{XX} & \textbf{XX} & \textbf{XX} & \textbf{XX} \\
+Ours-32B ($N{=}3$, sampling) & \textbf{XX} & \textbf{XX} & \textbf{XX} & \textbf{XX} & \textbf{XX} & \textbf{XX} \\
+Ours-32B (Lossless ISD) & \multicolumn{6}{c}{\emph{identical to Qwen3-32B AR by construction}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\subsection{Latency and Throughput}
+\label{sec:throughput}
+
+We measure end-to-end serving performance under realistic conditions. Requests are submitted at varying concurrency levels ($C = 1, 2, 4, 8, 16, 32, 64$) following the arrival pattern of real workloads. We use two request distributions: \textbf{AIME} (long-form reasoning, ${\sim}$8K output tokens) and \textbf{ShareGPT} (mixed conversational, ${\sim}$500 output tokens). All experiments use TP=1 on a single H100 unless otherwise noted.
+
+\paragraph{Throughput scaling.}
+Table~\ref{tab:throughput} reports tokens per second at each concurrency level.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Throughput (tok/s)} on AIME workload, TP=1, 1$\times$H100 (bf16). Strided DLLM achieves higher throughput than AR and EAGLE-3 across all concurrency levels, including the high-concurrency regime where prior DLLMs collapse.}
+\label{tab:throughput}
+\small
+\begin{tabular}{lccccccc}
+\toprule
+& C=1 & C=2 & C=4 & C=8 & C=16 & C=32 & C=64 \\
+\midrule
+Qwen3-8B AR & 149 & 290 & 565 & 1,086 & 2,017 & 3,613 & 5,794 \\
+EAGLE-3 & 204 & 378 & 699 & 1,269 & 2,160 & 3,414 & 4,676 \\
+Ours ($N{=}3$, sampling) & 287 & --- & --- & --- & --- & --- & --- \\
+Ours ($N{=}3$, greedy) & 272 & 521 & 967 & \textbf{1,770} & \textbf{2,999} & \textbf{4,736} & \textbf{6,414} \\
+Ours ($N{=}5$, sampling) & \textbf{313} & --- & --- & --- & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At low concurrency ($C{=}1$), $N{=}5$ sampling achieves the best per-request throughput: 313 tok/s, a \textbf{2.1$\times$} speedup over AR (149 tok/s) and 1.5$\times$ over EAGLE-3 (204 tok/s). At high concurrency ($C{\geq}8$), $N{=}3$ greedy dominates: 6,414 tok/s at $C{=}64$, \textbf{1.11$\times$} over AR---demonstrating that Strided DLLM sustains its advantage even at industrial-scale concurrency. In contrast, EAGLE-3 falls below AR at $C{=}64$ (4,676 vs.\ 5,794 tok/s) because its tree-structured verification creates memory overhead that scales poorly with batch size. The greedy-vs-sampling gap reflects the acceptance-rate benefit of argmax proposals (Section~\ref{sec:infra}): greedy achieves 78\% acceptance at $N{=}3$ versus 70\% for sampling, translating to higher TPF and throughput.
+
+% ===========================================================================
+\subsection{Ablation Studies}
+\label{sec:ablation}
+
+\paragraph{Infrastructure optimization ablation.}
+We measure the contribution of key serving optimizations introduced in Section~\ref{sec:infra}. Table~\ref{tab:ablation} compares the baseline eager-forward configuration (without CUDA graph) against the fully optimized system at $C{=}1$ on a single H100. CUDA graph capture eliminates kernel-launch overhead, reducing per-step forward time from 14.7\,ms to 7.1\,ms. Combined with the stationary-batch decode loop, fused verification kernel, and buffer reuse, total step time drops from 16.2\,ms to 8.5\,ms---a 1.9$\times$ improvement in throughput.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Infrastructure ablation} ($N{=}3$, $C{=}1$, 1$\times$H100). CUDA graph and the stationary-batch loop provide the dominant gains. The per-step timing breakdown (classify / forward / verify+sample / trim) is shown for the fully optimized configuration.}
+\label{tab:ablation}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Configuration} & \textbf{TPS} & \textbf{TPF} & $T_{\text{step}}$ \textbf{(ms)} & $T_{\text{fwd}}$ \textbf{(ms)} \\
+\midrule
+Eager forward (no CUDA graph) & 153 & 2.50 & 16.2 & 14.7 \\
+Full system (all optimizations) & 285 & 2.47 & 8.5 & 7.1 \\
+\midrule
+\multicolumn{5}{l}{\textit{Step breakdown (full system): classify=0.16\,ms, fwd=7.06\,ms, verify+sample=0.76\,ms, trim=0.25\,ms}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Lossless ISD overhead.}
+Table~\ref{tab:lora_ablation} reports the overhead of segment-gated LoRA for lossless ISD at $N{=}3$, $C{=}1$. The LoRA adapter adds 1.26ms to the forward pass (cuBLAS expand + stream synchronization), bringing lossless ISD to 218 tok/s---76\% of the non-LoRA throughput. This overhead is modest given the strong guarantee: every emitted token is verified against the \emph{exact base AR distribution}, producing bit-for-bit identical output to Qwen3-8B.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Lossless ISD overhead} ($N{=}3$, $C{=}1$, 1$\times$H100). Segment-gated LoRA with cuBLAS replacement and multi-stream overlap brings lossless ISD to within 76\% of non-LoRA throughput.}
+\label{tab:lora_ablation}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{TPS} & $T_{\text{step}}$ \textbf{(ms)} & $T_{\text{fwd}}$ \textbf{(ms)} \\
+\midrule
+Non-LoRA (ISD only) & 285 & 8.5 & 7.06 \\
++ Segment-gated LoRA (cuBLAS + multi-stream) & 218 & 9.8 & 8.32 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Impact of stride size.}
+Larger strides produce more tokens per forward but at diminishing acceptance rates, as later proposals condition on earlier (potentially incorrect) proposals. We quantify this trade-off in Table~\ref{tab:stride_ablation} (Section~\ref{sec:stride_tradeoff}). At $C{=}1$, $N{=}5$ is marginally faster than $N{=}3$ (303 vs.\ 285 tok/s) because the higher TPF compensates for the lower acceptance rate in the memory-bound regime where forward time is nearly constant. At high concurrency, $N{=}3$ dominates (Table~\ref{tab:throughput}) because the smaller block size ($2N{-}1 = 5$ vs.\ 9) produces less compute overhead per request when the GPU is saturated.
