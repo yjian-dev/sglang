@@ -2871,9 +2871,9 @@ class ServerArgs:
 
         if self.enable_lora:
             logger.warning(
-                "Currently LoRA is not supported by diffusion LLM inference."
+                "LoRA is enabled together with diffusion LLM inference. "
+                "This path relies on algorithm-specific handling."
             )
-            self.enable_lora = False
 
         if self.disaggregation_mode != "null":
             logger.warning(

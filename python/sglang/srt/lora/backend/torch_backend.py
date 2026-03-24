@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.torch_ops import sgemm_lora_a_fwd, sgemm_lora_b_fwd
-from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
+from sglang.srt.lora.utils import LoRABatchInfo, generate_lora_segment_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -184,7 +184,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         scalings: list[float],
         use_cuda_graph: bool,
     ):
-        original_seq_lens_cpu = generate_sequence_lengths(forward_batch, device="cpu")
+        original_seq_lens_cpu = generate_lora_segment_lengths(forward_batch, device="cpu")
         original_weight_indices_tensor = torch.tensor(
             weight_indices, dtype=torch.int32, device="cpu"
         )

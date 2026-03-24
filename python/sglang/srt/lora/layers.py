@@ -334,15 +334,49 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
+    def _overlap_shrink_weights(self):
+        """Return (A_weights, num_slices) for overlap shrink."""
+        return self.A_buffer, 1
+
+    def _overlap_expand(self, backend, shrink_out, base_output):
+        """Run overlap expand for this layer type."""
+        return backend.run_cublas_expand_simple(shrink_out, self.B_buffer, base_output)
+
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in ColumnParallelLinear
-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
+        backend = self.lora_backend
 
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_)
+        if self.set_lora and backend.can_overlap():
+            # Two-stream overlap: shrink on lora_stream, base on main stream
+            s_main = torch.cuda.current_stream()
+            s_lora = backend.lora_stream
+            A_weights, num_slices = self._overlap_shrink_weights()
+
+            # Fork: lora stream waits for input_ to be ready, then runs shrink
+            s_lora.wait_stream(s_main)
+            with torch.cuda.stream(s_lora):
+                shrink_out = backend.run_cublas_shrink(input_, A_weights, num_slices)
+
+            # Base matmul on main stream (concurrent with shrink)
+            bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+            output_parallel = self.base_layer.quant_method.apply(
+                self.base_layer, input_, bias
+            )
+
+            # Join: lora stream waits for base output, then runs expand
+            s_lora.wait_stream(s_main)
+            with torch.cuda.stream(s_lora):
+                self._overlap_expand(backend, shrink_out, output_parallel)
+
+            # Main stream waits for expand to finish
+            s_main.wait_stream(s_lora)
+        else:
+            bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+            output_parallel = self.base_layer.quant_method.apply(
+                self.base_layer, input_, bias
+            )
+            if self.set_lora:
+                output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -399,6 +433,16 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             base_output=base_output,
         )
         return lora_output
+
+    def _overlap_shrink_weights(self):
+        """Return (A_weights, num_slices) for overlap shrink."""
+        return self.A_buffer_gate_up, 2
+
+    def _overlap_expand(self, backend, shrink_out, base_output):
+        """Run overlap expand for GateUp layer (2-slice addmm_)."""
+        return backend.run_cublas_expand_gate_up(
+            shrink_out, self.B_buffer_gate_up, base_output
+        )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
@@ -463,6 +507,16 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
         return lora_output
+
+    def _overlap_shrink_weights(self):
+        """Return (A_weights, num_slices) for overlap shrink."""
+        return self.A_buffer_qkv, 3
+
+    def _overlap_expand(self, backend, shrink_out, base_output):
+        """Run overlap expand for QKV layer (3-slice addmm_)."""
+        return backend.run_cublas_expand_qkv(
+            shrink_out, self.B_buffer_qkv, base_output, self.output_offset_cpu
+        )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
@@ -537,12 +591,41 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
-        )
 
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_parallel)
+        backend = self.lora_backend
+
+        if self.set_lora and backend.can_overlap():
+            # Two-stream overlap: shrink on lora_stream, base on main stream
+            s_main = torch.cuda.current_stream()
+            s_lora = backend.lora_stream
+
+            # Fork: lora stream waits for input, then runs shrink
+            s_lora.wait_stream(s_main)
+            with torch.cuda.stream(s_lora):
+                shrink_out = backend.run_cublas_shrink(
+                    input_parallel, self.A_buffer, 1
+                )
+
+            # Base matmul on main stream (concurrent with shrink)
+            output_parallel = self.base_layer.quant_method.apply(
+                self.base_layer, input_parallel
+            )
+
+            # Join: lora stream waits for base, then runs expand
+            s_lora.wait_stream(s_main)
+            with torch.cuda.stream(s_lora):
+                backend.run_cublas_expand_simple(
+                    shrink_out, self.B_buffer, output_parallel
+                )
+
+            # Main stream waits for expand
+            s_main.wait_stream(s_lora)
+        else:
+            output_parallel = self.base_layer.quant_method.apply(
+                self.base_layer, input_parallel
+            )
+            if self.set_lora:
+                output_parallel = self.apply_lora(output_parallel, input_parallel)
 
         if (
             self.base_layer.reduce_results

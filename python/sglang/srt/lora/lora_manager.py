@@ -155,9 +155,21 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
         if lora_config.lora_added_tokens_size > 0:
-            raise ValueError(
-                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
-            )
+            # Check if all added tokens are within base vocab (metadata-only, no new embeddings needed)
+            added_cfg = lora_config.added_tokens_config or {}
+            base_vocab = self.base_hf_config.vocab_size
+            all_within_base = all(int(v) < base_vocab for v in added_cfg.values())
+            if all_within_base:
+                logger.info(
+                    f"Ignoring metadata-only added_tokens for LoRA adapter {lora_ref.lora_name}; "
+                    f"all token ids are within base vocab size {base_vocab}."
+                )
+                lora_config.lora_added_tokens_size = 0
+                lora_config.added_tokens_config = None
+            else:
+                raise ValueError(
+                    f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+                )
 
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
@@ -263,7 +275,18 @@ class LoRAManager:
         )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        # When cuBLAS ops are captured in the CUDA graph, the graph replays
+        # baked-in mm/addmm_ ops regardless of batch_info. Skip the expensive
+        # permutation/segment computation during decode replay.
+        if (
+            self.lora_backend.cublas_graph_captured
+            and forward_batch.forward_mode.is_cuda_graph()
+        ):
+            return
+
         # set up batch info shared by all lora modules
+        from sglang.srt.lora.utils import get_lora_segment_ids
+
         bs = forward_batch.batch_size
 
         use_cuda_graph = (
@@ -272,15 +295,18 @@ class LoRAManager:
             and forward_batch.forward_mode.is_cuda_graph()
         )
 
-        weight_indices = [0] * len(forward_batch.lora_ids)
+        lora_ids = get_lora_segment_ids(forward_batch)
+        weight_indices = [0] * len(lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
-        for i, uid in enumerate(forward_batch.lora_ids):
+        for i, uid in enumerate(lora_ids):
+            if uid is None:
+                weight_indices[i] = 0  # base slot (no LoRA)
+                continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None:
-                lora = self.loras[uid]
-                lora_ranks[weight_indices[i]] = lora.config.r
-                scalings[weight_indices[i]] = lora.scaling
+            lora = self.loras[uid]
+            lora_ranks[weight_indices[i]] = lora.config.r
+            scalings[weight_indices[i]] = lora.scaling
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
