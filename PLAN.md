@@ -243,3 +243,40 @@ curl -X POST http://localhost:8000/shutdown -H "Authorization: Bearer r2egym-hic
 4. Kill AR servers, launch DLLM servers
 5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
 6. Record all results in final table
+
+
+## Evaluator Feedback (Iteration 7)
+1. Contact hkang via Slack/email to negotiate GPU access or ask when GPUs will be free. 2. If urgent and hkang agrees, shut down their server via: curl -X POST http://localhost:8000/shutdown -H 'Authorization: Bearer r2egym-hicache-20260323'. 3. Once GPUs are free, run the 2 remaining AR benchmarks (MMLU-Pro, MMLU) first. 4. Then switch to DLLM servers and run all 6 DLLM benchmarks sequentially. 5. After all runs complete with Errors=0, add a '## Final Results' section to PLAN.md with the full 14-benchmark comparison table.
+
+### Iteration 8 — Still Blocked by GPU Availability (2026-03-26, ~09:35 PDT)
+
+**Blocker: All 8 GPUs still occupied by hkang's MiniMax-M2.5 job**
+- hkang's job still running (PID 3942587), started at 07:30, now ~2h+ uptime
+- All 8 GPUs at ~74GB used, 100% GPU utilization
+- Server actively processing: 46 running requests (confirmed via /metrics endpoint)
+- hkang is NOT logged into the machine
+
+**No benchmarks could be run this iteration. This is the 7th consecutive blocked iteration (iterations 2-8).**
+
+**Summary of completed AR benchmarks (from iteration 1):**
+
+| # | Benchmark | AR Result | Status |
+|---|-----------|-----------|--------|
+| 1 | AIME-25 | 63.3% (19/30) | DONE |
+| 2 | GPQA-Diamond | 67.7% (134/198) | DONE |
+| 3 | GPQA (main) | 65.2% (292/448) | DONE |
+| 4 | LCB-v6 | 58.3% (102/175) | DONE |
+| 5 | MMLU-Pro | — | NEEDS RERUN (server crashed in iter 1) |
+| 6 | MMLU | — | PENDING |
+
+**Action needed: User (yjian) must either:**
+1. Contact hkang via Slack/email to negotiate GPU access, OR
+2. Shut down hkang's server (with permission): `curl -X POST http://localhost:8000/shutdown -H "Authorization: Bearer r2egym-hicache-20260323"`
+
+**Next steps (after GPUs are free):**
+1. Launch AR servers (4x TP=2, ports 30000-30003)
+2. Run MMLU-Pro on AR (`--timeout 900 --max-workers 16`)
+3. Run MMLU on AR (`--timeout 900 --max-workers 16`)
+4. Kill AR servers, launch DLLM servers
+5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
+6. Record all results in final table
