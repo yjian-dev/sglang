@@ -351,3 +351,7 @@ Continue waiting for MMLU-Pro AR to finish (~8+ more hours). Then: 1) Verify Err
 4. Kill AR servers, launch DLLM servers
 5. Run all 6 DLLM benchmarks sequentially
 6. Record all results in final table
+
+
+## Evaluator Feedback (Iteration 49)
+Continue waiting for MMLU-Pro AR to finish (~7-8 more hours). Then: 1) Verify Errors=0, record result. 2) Run MMLU AR eval, verify Errors=0, record result. 3) Switch to DLLM servers and run all 6 remaining DLLM benchmarks sequentially (AIME-25, GPQA-Diamond, GPQA, LCB-v6, MMLU-Pro, MMLU), verifying Errors=0 after each. 4) Move completed AR results for AIME-25, GPQA-Diamond, GPQA, LCB-v6 into the completed table. 5) Add a 'Final Results' section to PLAN.md with all 14 benchmarks filled. 6) Remove all 'need' entries from PLAN.md.
