@@ -931,3 +931,31 @@ curl -X POST http://localhost:8000/shutdown -H "Authorization: Bearer r2egym-hic
 4. Kill AR servers, launch DLLM servers
 5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
 6. Record all results in final table
+
+
+## Evaluator Feedback (Iteration 34)
+1. Contact hkang via Slack/email to negotiate GPU access or ask when GPUs will be free. 2. If urgent and hkang agrees, shut down their server via: curl -X POST http://localhost:8000/shutdown -H 'Authorization: Bearer r2egym-hicache-20260323'. 3. Once GPUs are free, run the 2 remaining AR benchmarks (MMLU-Pro, MMLU) first. 4. Then switch to DLLM servers and run all 6 DLLM benchmarks sequentially. 5. After all runs complete with Errors=0, add a '## Final Results' section to PLAN.md with the full 14-benchmark comparison table.
+
+### Iteration 35 — Still Blocked by GPU Availability (2026-03-26, ~12:10 PDT)
+
+**Blocker: All 8 GPUs still occupied by hkang's MiniMax-M2.5 job (34th consecutive blocked iteration)**
+- hkang's job still running (PID 3942587), uptime ~2h18m
+- All 8 GPUs at ~74GB used, **0% GPU utilization** (server is IDLE but holding memory)
+- Server responds on port 8000 (confirmed via /v1/models endpoint)
+- hkang is NOT logged into the machine
+
+**New observation: Server is completely idle (0% GPU util).** It's just sitting there holding all GPU memory with no active requests. This makes the shutdown request more reasonable since hkang isn't actively using it.
+
+**No benchmarks could be run this iteration.**
+
+**Action needed: User (yjian) must either:**
+1. Contact hkang via Slack/email to negotiate GPU access (server is idle, so this is a good time), OR
+2. Shut down hkang's server (with permission): `curl -X POST http://localhost:8000/shutdown -H "Authorization: Bearer r2egym-hicache-20260323"`
+
+**Next steps (after GPUs are free):**
+1. Launch AR servers (4x TP=2, ports 30000-30003)
+2. Run MMLU-Pro on AR (`--timeout 900 --max-workers 16`)
+3. Run MMLU on AR (`--timeout 900 --max-workers 16`)
+4. Kill AR servers, launch DLLM servers
+5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
+6. Record all results in final table
