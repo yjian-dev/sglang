@@ -84,3 +84,25 @@ Remaining: AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU for both AR and DLLM.
 4. Kill AR servers, launch DLLM servers
 5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
 6. Record all results in final table
+
+
+## Evaluator Feedback (Iteration 2)
+1. Wait for GPUs to become available (check with 'nvidia-smi' periodically or contact hkang). 2. Once GPUs are free, launch AR servers and run the 2 remaining AR benchmarks (MMLU-Pro, MMLU) sequentially. 3. Kill AR servers, launch DLLM servers, and run all 6 DLLM benchmarks (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU) sequentially. 4. Verify Errors=0 for each run before recording results. 5. After all runs complete, add a proper '## Final Results' section to PLAN.md with the full 14-benchmark comparison table replacing all 'need'/'redo' entries with actual values.
+
+### Iteration 3 — Still Blocked by GPU Availability (2026-03-26)
+
+**Blocker: All 8 GPUs still occupied by hkang's MiniMax-M2.5 job**
+- hkang's job has been running for ~1h51m, still actively serving on port 8000
+- All 8 GPUs at ~74GB used, 38-89% GPU utilization (actively processing)
+- Same PIDs as iteration 2 (3942849-3942857)
+- No indication of when the job will finish
+
+**No benchmarks could be run this iteration.**
+
+**Next steps (after GPUs are free):**
+1. Launch AR servers (4x TP=2, ports 30000-30003)
+2. Run MMLU-Pro on AR (`--timeout 900 --max-workers 16`)
+3. Run MMLU on AR (`--timeout 900 --max-workers 16`)
+4. Kill AR servers, launch DLLM servers
+5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
+6. Record all results in final table
