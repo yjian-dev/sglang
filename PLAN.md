@@ -62,3 +62,25 @@ Remaining: AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU for both AR and DLLM.
 4. Kill AR servers, launch DLLM servers
 5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
 6. Record all results in final table
+
+
+## Evaluator Feedback (Iteration 1)
+1. Free GPU memory first: get admin help to reboot the machine or kill stuck CUDA processes. 2. After GPUs are free, launch AR servers and run MMLU-Pro and MMLU (the two remaining AR benchmarks). 3. Kill AR servers, launch DLLM servers, and run all 6 benchmarks sequentially for DLLM. 4. After all 12 runs complete with Errors=0, update PLAN.md with a 'Final Results' section containing the full 14-benchmark comparison table.
+
+### Iteration 2 — Blocked by GPU Availability (2026-03-26)
+
+**Blocker: All 8 GPUs occupied by another user (`hkang`)**
+- Machine was rebooted (stuck processes from iteration 1 are gone)
+- User `hkang` launched MiniMax-M2.5 with TP=8, EP=8 on all 8 GPUs (~74GB each)
+- Process owner: hkang (PIDs 3942849-3942857), port 8000
+- Cannot proceed until hkang's job finishes or GPUs become available
+
+**No benchmarks could be run this iteration.**
+
+**Next steps (after GPUs are free):**
+1. Launch AR servers (4x TP=2, ports 30000-30003)
+2. Run MMLU-Pro on AR (`--timeout 900 --max-workers 16`)
+3. Run MMLU on AR (`--timeout 900 --max-workers 16`)
+4. Kill AR servers, launch DLLM servers
+5. Run all 6 benchmarks on DLLM (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
+6. Record all results in final table
