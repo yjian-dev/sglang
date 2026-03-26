@@ -109,3 +109,26 @@ MMLU-Pro AR running. MMLU AR pending. Then all 6 DLLM benchmarks.
 4. Kill AR servers, launch DLLM servers
 5. Run all 6 DLLM benchmarks sequentially (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
 6. Record all results in final table
+
+
+## Evaluator Feedback (Iteration 38)
+1. Wait for MMLU-Pro AR to finish (~11 more hours), verify Errors=0, record result. 2. Run MMLU AR eval, verify Errors=0, record result. 3. Switch to DLLM servers and run all 6 remaining DLLM benchmarks sequentially (AIME-25, GPQA-Diamond, GPQA, LCB-v6, MMLU-Pro, MMLU), verifying Errors=0 after each. 4. Move completed AR results for AIME-25, GPQA-Diamond, GPQA, LCB-v6 into the completed table. 5. Add a 'Final Results' section to PLAN.md with all 14 benchmarks filled. 6. Remove all 'need' entries from PLAN.md.
+
+### Iteration 39 — MMLU-Pro AR Still Running (2026-03-26, ~12:08 PDT)
+
+**Status check:**
+- MMLU-Pro AR eval PID 6293 still running (1h08m elapsed)
+- All 8 GPUs at 100% utilization, servers healthy at ~285 tok/s
+- ~283 prefills/server × 4 = ~1131/12032 problems (~9.4% done)
+- Rate: ~16.6 problems/min → **ETA ~22:00-23:00 PDT March 26** (~10.5 more hours)
+- No progress checkpoints printed yet (first at 20% = ~2406 problems)
+
+**No action needed** — eval progressing normally at expected rate.
+
+**Next steps (unchanged):**
+1. Wait for MMLU-Pro AR to complete (check `tail /tmp/mmlu_pro_ar.log`)
+2. Verify Errors=0; if errors > 0, rerun with --max-workers 8
+3. Run MMLU AR eval (`--timeout 900 --max-workers 16`)
+4. Kill AR servers, launch DLLM servers
+5. Run all 6 DLLM benchmarks sequentially (AIME-25, GPQA-D, GPQA, LCB-v6, MMLU-Pro, MMLU)
+6. Record all results in final table
