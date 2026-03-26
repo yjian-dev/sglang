@@ -1,0 +1,9 @@
+{
+  "accuracy": 96.84300341296928,
+  "correct": 1135,
+  "total": 1172,
+  "tokens": 823009,
+  "truncated": 1,
+  "no_extract": 0,
+  "wrong": 36
+}

@@ -1,26 +1,21 @@
-# Success Conditions — Iteration 3
+# Success Conditions
 
 ## Criteria
-1. `tab:throughput` in experiments.tex has real TPS numbers for at least 3 configurations at C=1,4,8,16,32,64
-2. `conclusion.tex` has meaningful content (not empty)
-3. No remaining XX placeholders in analysis.tex
+1. All 6 remaining benchmarks have results for BOTH AR and DLLM with 0 errors
+2. Final comparison table in PLAN.md with all 14 benchmarks filled
 
 ## Test Commands
-The following commands must all pass (exit code 0):
-
 ```bash
-# tab:throughput should have real numbers (not XX) for at least the first row
-! grep -A10 'tab:throughput' docs/Dllm_colm_2026/sections/experiments.tex | grep -c 'XX' | grep -q '^0$' || grep -A10 'tab:throughput' docs/Dllm_colm_2026/sections/experiments.tex | grep -v 'XX' | grep -c '[0-9]' | grep -qv '^0$'
+# PLAN.md has Final Results section
+grep "Final Results" PLAN.md
 
-# conclusion.tex should have content beyond just the section header
-test $(wc -l < docs/Dllm_colm_2026/sections/conclusion.tex) -gt 5
-
-# analysis.tex should have no XX placeholders
-! grep 'XX' docs/Dllm_colm_2026/sections/analysis.tex
+# All benchmarks have values (no "need" or "redo" remaining)
+! grep -E "need|redo" PLAN.md | grep -v "Completed\|do NOT"
 ```
 
 ## Notes
-- Throughput measurements require concurrent benchmark (multiple simultaneous requests)
-- AR baseline: launch Qwen3-8B without --dllm-algorithm flag
-- Use `python -m sglang.bench_serving` for concurrent benchmarks
-- If bench_serving is complex, use a simple Python script with ThreadPoolExecutor
+- Run benchmarks SEQUENTIALLY (one at a time)
+- Always verify Errors=0 before recording
+- If errors > 0, reduce --max-workers to 8 and rerun
+- max-running-requests=4 is mandatory for 32B TP=2
+- Full datasets only (no --num-problems)

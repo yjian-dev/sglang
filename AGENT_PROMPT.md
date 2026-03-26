@@ -1,50 +1,98 @@
-# Agent Prompt — Strided DLLM Paper Ablation & Writing
+# Agent Prompt — 32B Benchmark Evaluation (Remaining Tests)
 
 ## Role
-You are a systems research agent writing the infrastructure section of a COLM 2026 paper on Strided DLLM inference. You run experiments, collect real measurements, and write/update LaTeX paper sections.
+You are a benchmark evaluation agent. You launch servers, run benchmarks, record results, and debug failures.
 
-## Project Description
-Complete the remaining experiments and paper writing for the Strided DLLM paper at `docs/Dllm_colm_2026/`. The detailed inference system design is documented in `docs/strided_dllm_inference_system.md`.
+## Current State
+Most benchmarks done. Need to run remaining ones for both Qwen3-32B AR and DLLM-32B b1 merged.
 
-### Current State (after iteration 2)
-- §3.3 Infrastructure (method.tex) — DONE, rewritten with structured paragraphs
-- §5 Analysis (analysis.tex) — DONE, 5 subsections with tables
-- Experiments 1-3 — DONE (non-LoRA ablation, LoRA ablation, stride size)
-- Tables filled: `tab:ablation`, `tab:lora_ablation`, `tab:step_breakdown`, `tab:stride_ablation`, `tab:efficiency`
+### Completed Results (KEEP these, do NOT rerun)
 
-### Remaining Work
-1. **Experiment 4: Throughput vs Concurrency** — Fill `tab:throughput` in experiments.tex
-   - Need concurrent benchmark at C=1,4,8,16,32,64 for: Qwen3-8B AR, Ours N=3, Ours N=5
-   - Use `python -m sglang.bench_serving` or custom concurrent script
-   - AIME-style prompts (long output, max_tokens=2048+)
+| Benchmark | Qwen3-32B AR | DLLM-32B b1 merged |
+|-----------|-------------|-------------------|
+| HumanEval | 96.3% | 96.3% |
+| MBPP | 95.7% | 94.6% |
+| IFEval | 84.5% | 84.7% |
+| GSM8K | 94.7% | 95.9% |
+| MATH-500 | 97.8% | 97.6% |
+| ARC-C | 97.2% | 96.8% |
+| AIME-24 | 76.7% | 83.3% |
+| TriviaQA | 74.4% | 72.9% |
 
-2. **TP=4 scaling data** — Fill `tab:tp_scaling` in analysis.tex (optional, needs 4 GPUs)
+### Remaining To Test (for BOTH AR and DLLM)
+Ordered by estimated time (fastest first):
 
-3. **Conclusion** — Write `docs/Dllm_colm_2026/sections/conclusion.tex`
+| # | Benchmark | Command | Est. Time | Problems |
+|---|-----------|---------|-----------|----------|
+| 1 | AIME-25 | `python scripts/eval_aime.py --year 2025` | ~10 min | 30 |
+| 2 | GPQA-Diamond | `python scripts/eval_gpqa.py --subset diamond` | ~15 min | 198 |
+| 3 | GPQA (main) | `python scripts/eval_gpqa.py` | ~15 min | 198 |
+| 4 | LCB-v6 | `python scripts/eval_lcb.py` | ~30 min | ~200 |
+| 5 | MMLU-Pro | `python scripts/eval_mmlu_pro.py` | ~2-4 hrs | full |
+| 6 | MMLU | `python scripts/eval_mmlu.py` | ~4-8 hrs | full |
 
-4. **Remaining XX in experiments.tex** — Training details (ask for from Chenfeng, skip for now), 32B results (skip)
+**Run FULL datasets** — no --num-problems flag (except if it takes >8 hours, then use --num-problems 2000).
+
+## Critical Lessons Learned
+1. **max-running-requests=4** for 32B TP=2 — larger causes OOM
+2. **max-workers=16** — too many concurrent requests cause failures
+3. **timeout=600** (900 for MMLU/MMLU-Pro) — thinking mode is slow
+4. **Always check Errors count** — if errors > 0, results are INVALID, rerun with --max-workers 8
+5. **Run benchmarks SEQUENTIALLY** — not in parallel
+
+## Server Configs
+
+### Qwen3-32B AR (4 servers, TP=2, ports 30000-30003)
+```bash
+for p in 30000 30001 30002 30003; do lsof -ti:$p | xargs -r kill -9; done; sleep 5
+for i in 0 1 2 3; do
+  gpu_start=$((i*2)); gpu_end=$((i*2+1)); port=$((30000+i))
+  CUDA_VISIBLE_DEVICES=${gpu_start},${gpu_end} \
+  nohup python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-32B --trust-remote-code --tp-size 2 \
+    --mem-fraction-static 0.85 --max-running-requests 4 \
+    --attention-backend flashinfer --dtype bfloat16 --port $port \
+    > /tmp/sglang_ar_${i}.log 2>&1 &
+done
+```
+
+### DLLM-32B b1 merged N=3 (4 servers, TP=2, ports 30000-30003)
+```bash
+for p in 30000 30001 30002 30003; do lsof -ti:$p | xargs -r kill -9; done; sleep 5
+for i in 0 1 2 3; do
+  gpu_start=$((i*2)); gpu_end=$((i*2+1)); port=$((30000+i))
+  CUDA_VISIBLE_DEVICES=${gpu_start},${gpu_end} \
+  nohup python -m sglang.launch_server \
+    --model-path /data/yjian/models/Qwen3-32B-b1-merged-lora1024-step18000 \
+    --trust-remote-code --tp-size 2 \
+    --mem-fraction-static 0.85 --max-running-requests 4 \
+    --attention-backend flashinfer \
+    --dllm-algorithm DreamShiftBlockN \
+    --dllm-algorithm-config dreamshift_blockN3_config.yaml \
+    --dtype bfloat16 --port $port \
+    > /tmp/sglang_dllm_${i}.log 2>&1 &
+done
+```
+
+## Common Args for ALL Benchmarks
+```
+--ports 30000 30001 30002 30003 --max-tokens 32768 --timeout 600 --max-workers 16
+```
+For MMLU/MMLU-Pro: add `--timeout 900`
 
 ## Environment
 ```bash
 source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
 export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-12.9
+export HF_HOME=/data/yjian/hf_cache
 ```
 
-Code: `/data/yjian/code/sglang`, branch `jyq/strided-dllm-clean`, already pip installed.
-
-## Key Resources
-- Design doc: `docs/strided_dllm_inference_system.md`
-- Benchmark script: `python scripts/bench_gsm8k_quick.py --port 31003 [--lora b3lora] [--num-problems N]`
-- Server configs: `dreamshift_blockN3_config.yaml`, `dreamshift_blockN5_config.yaml`, `dreamshift_blockN3_conditional_lora.yaml`
-- Non-LoRA model: `/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont`
-- LoRA base: `/data/cxu/dllm-distillation/training/model/Qwen3-8B-b3-allmasked-causal`
-- LoRA adapter: `/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b3-causal-from-b2amc-lora128_fixed2`
-
-## Constraints
-- Use GPU 2 (`CUDA_VISIBLE_DEVICES=2`), port 31003
-- Kill previous server before launching: `lsof -ti:31003 | xargs -r kill -9`
-- Wait for "ready to roll" before sending requests
-- LoRA requests MUST include `"lora_path":"b3lora"`
-- All numbers must come from real measurements, not estimates
-- Always update PLAN.md Progress Log after each experiment
+## Workflow
+1. Kill all servers
+2. Launch AR servers, wait for "ready to roll" in ALL 4 logs
+3. Run benchmarks 1-6 sequentially on AR. After each: check Errors, record in PLAN.md
+4. Kill AR servers
+5. Launch DLLM servers, wait for "ready to roll" in ALL 4 logs
+6. Run benchmarks 1-6 sequentially on DLLM. After each: check Errors, record in PLAN.md
+7. Write Final Results table in PLAN.md

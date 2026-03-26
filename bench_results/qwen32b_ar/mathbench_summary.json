@@ -1,0 +1,92 @@
+{
+  "overall_acc": 91.07576166082502,
+  "correct": 3378,
+  "total": 3709,
+  "splits": {
+    "college/single_choice_cn": {
+      "acc": 81.33333333333333,
+      "correct": 122,
+      "total": 150
+    },
+    "college/single_choice_en": {
+      "acc": 96.0,
+      "correct": 144,
+      "total": 150
+    },
+    "high/single_choice_cn": {
+      "acc": 92.0,
+      "correct": 138,
+      "total": 150
+    },
+    "high/single_choice_en": {
+      "acc": 95.33333333333334,
+      "correct": 143,
+      "total": 150
+    },
+    "middle/single_choice_cn": {
+      "acc": 97.33333333333334,
+      "correct": 146,
+      "total": 150
+    },
+    "middle/single_choice_en": {
+      "acc": 98.0,
+      "correct": 147,
+      "total": 150
+    },
+    "college_knowledge/single_choice_cn": {
+      "acc": 91.13924050632912,
+      "correct": 288,
+      "total": 316
+    },
+    "college_knowledge/single_choice_en": {
+      "acc": 93.35443037974683,
+      "correct": 295,
+      "total": 316
+    },
+    "high_knowledge/single_choice_cn": {
+      "acc": 90.0,
+      "correct": 423,
+      "total": 470
+    },
+    "high_knowledge/single_choice_en": {
+      "acc": 88.96797153024912,
+      "correct": 250,
+      "total": 281
+    },
+    "middle_knowledge/single_choice_cn": {
+      "acc": 85.32934131736528,
+      "correct": 285,
+      "total": 334
+    },
+    "middle_knowledge/single_choice_en": {
+      "acc": 85.71428571428571,
+      "correct": 150,
+      "total": 175
+    },
+    "primary_knowledge/single_choice_cn": {
+      "acc": 97.11538461538461,
+      "correct": 202,
+      "total": 208
+    },
+    "primary_knowledge/single_choice_en": {
+      "acc": 94.4954128440367,
+      "correct": 103,
+      "total": 109
+    },
+    "primary/cloze_cn": {
+      "acc": 96.0,
+      "correct": 144,
+      "total": 150
+    },
+    "primary/cloze_en": {
+      "acc": 90.66666666666666,
+      "correct": 136,
+      "total": 150
+    },
+    "arithmetic/cloze_en": {
+      "acc": 87.33333333333333,
+      "correct": 262,
+      "total": 300
+    }
+  }
+}
