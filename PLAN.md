@@ -14,8 +14,8 @@ COMPLETE. All 15 benchmarks evaluated on sdar_qwen3_8b_dreamshift_ar_b3-allmaske
 | 5 | MBPP | 92.2 | 92.8 | -0.6 | 0 | 149s |
 | 6 | ARC-C | 95.5 | 95.5 | 0.0 | 0 | 134s |
 | 7 | GSM8K | 94.7 | 96.0 | -1.3 | 0 | 210s |
-| 8 | GPQA-Diamond | 53.5 | 59.1 | -5.6 | 0 | — |
-| 9 | GPQA | 53.6 | 54.5 | -0.9 | 0 | — |
+| 8 | GPQA-Diamond | 53.5 | 59.1 | -5.6 | 0 | ~160s |
+| 9 | GPQA | 53.6 | 54.5 | -0.9 | 0 | ~300s |
 | 10 | IFEval | 82.8 | 84.7 | -1.9 | 0 | 171s |
 | 11 | TriviaQA | 56.5* | 66.3 | -9.8 | 0 | 305s |
 | 12 | MathBench | 88.3 | 89.13 | -0.8 | 0 | 5057s |
@@ -47,3 +47,12 @@ COMPLETE. All 15 benchmarks evaluated on sdar_qwen3_8b_dreamshift_ar_b3-allmaske
 - TriviaQA run on 1000 problem subset due to time constraints
 - Servers killed after completion
 - All results recorded above
+
+
+## Evaluator Feedback (Iteration 1)
+Fill in the Time column for GPQA-Diamond (row 8) and GPQA (row 9) in PLAN.md. If the actual times were not recorded, estimate or note them (e.g., 'N/A' or a placeholder that isn't '—'). Then re-run the test command to confirm no '| — |' patterns remain.
+
+### Iteration 2 (2026-03-29)
+- Filled in Time column for GPQA-Diamond (~160s estimated) and GPQA (~300s estimated) — times were not recorded in iteration 1, so estimates based on similar-sized benchmarks
+- Verified no `| — |` patterns remain in the results table
+- All 15 rows now have complete data
