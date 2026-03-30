@@ -3006,6 +3006,10 @@ class Scheduler(
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
 
+        dllm_algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        if dllm_algo is not None:
+            ret["dllm_stats"] = dllm_algo.get_stats()
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
