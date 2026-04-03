@@ -1,0 +1,62 @@
+{
+  "N=2": {
+    "math500": {
+      "acc": 88.2,
+      "tps": 2532.0
+    },
+    "mbpp": {
+      "acc": 54.9,
+      "tps": 3273.0
+    },
+    "dllm_stats": {
+      "total_forwards": 63789,
+      "total_tokens": 2656259,
+      "batch_tpf": 41.64
+    }
+  },
+  "N=3": {
+    "math500": {
+      "acc": 88.8,
+      "tps": 3261.4
+    },
+    "mbpp": {
+      "acc": 52.9,
+      "tps": 4095.9
+    },
+    "dllm_stats": {
+      "total_forwards": 47784,
+      "total_tokens": 2670163,
+      "batch_tpf": 55.88
+    }
+  },
+  "N=4": {
+    "math500": {
+      "acc": 89.0,
+      "tps": 3712.2
+    },
+    "mbpp": {
+      "acc": 54.9,
+      "tps": 4583.0
+    },
+    "dllm_stats": {
+      "total_forwards": 39846,
+      "total_tokens": 2629278,
+      "batch_tpf": 65.99
+    }
+  },
+  "N=8": {
+    "math500": {
+      "acc": 89.2,
+      "tps": 3861.0
+    },
+    "mbpp": {
+      "acc": 55.3,
+      "tps": 4369.0
+    },
+    "dllm_stats": {
+      "total_forwards": 31146,
+      "total_tokens": 2644886,
+      "batch_tpf": 84.92
+    }
+  }
+}

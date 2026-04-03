@@ -255,3 +255,46 @@ DFlash env vars: `SGLANG_ENABLE_SPEC_V2=1`, `SGLANG_ENABLE_DFLASH_SPEC_V2=1`, `S
 | 16 | 125 | **280** | 204 | 228 | 249 |
 | 32 | 113 | **181** | 184 | 176 | 197 |
 | 64 | 92 | 101 | **135** | 111 | 125 |
+
+---
+
+## Table 8: DLLM Baseline Comparison — LLaDA 2.1-mini & SDAR
+
+LLaDA 2.1-mini (16B MoE, JointThreshold block=4) and SDAR (8B, LowConfidence block=4, denoising_steps=4).
+Both served via sglang-llada2 worktree. Same settings: bf16, TP=1, mem=0.85, burst, max_tokens=2048.
+
+### MBPP (257 problems) — Job TPS / Per-Req TPS
+
+| bs | LLaDA2 Job | LLaDA2 Per-Req | SDAR Job | SDAR Per-Req |
+|----|-----------|---------------|---------|-------------|
+| 1 | 455 | 464 | 106 | 108 |
+| 2 | 705 | 360 | 196 | 99 |
+| 4 | 978 | 249 | 357 | 90 |
+| 8 | 1,246 | 158 | 622 | 78 |
+| 16 | 1,637 | 104 | 977 | 62 |
+| 32 | 1,999 | 63 | 1,408 | 44 |
+| 64 | 2,418 | 38 | 1,745 | 27 |
+
+### MATH-500 (500 problems) — Job TPS / Per-Req TPS
+
+| bs | LLaDA2 Job | LLaDA2 Per-Req | SDAR Job | SDAR Per-Req |
+|----|-----------|---------------|---------|-------------|
+| 1 | 398 | 467 | 121 | 125 |
+| 2 | 653 | 342 | 210 | 107 |
+| 4 | 908 | 241 | 367 | 93 |
+| 8 | 1,185 | 155 | 625 | 80 |
+| 16 | 1,497 | 96 | 999 | 64 |
+| 32 | 1,835 | 59 | 1,424 | 45 |
+| 64 | 2,333 | 37 | 1,781 | 28 |
+
+### LMSYS-Chat (182 problems) — Job TPS / Per-Req TPS
+
+| bs | LLaDA2 Job | LLaDA2 Per-Req | SDAR Job | SDAR Per-Req |
+|----|-----------|---------------|---------|-------------|
+| 1 | 341 | 356 | 117 | 122 |
+| 2 | 487 | 255 | 200 | 102 |
+| 4 | 679 | 176 | 354 | 91 |
+| 8 | 961 | 125 | 616 | 80 |
+| 16 | 1,288 | 83 | 956 | 62 |
+| 32 | 1,614 | 52 | 1,396 | 45 |
+| 64 | 1,916 | 31 | 1,737 | 28 |

@@ -1,0 +1,65 @@
+[
+  {
+    "label": "SDAR thr=0.0",
+    "algorithm": "LowConfidence",
+    "threshold": 0.0,
+    "dataset": "math",
+    "concurrency": 4,
+    "num_requests": 20,
+    "output_len": 512,
+    "tpf_single": 1.9792,
+    "tps": 725.53
+  },
+  {
+    "label": "SDAR thr=0.3",
+    "algorithm": "LowConfidence",
+    "threshold": 0.3,
+    "dataset": "math",
+    "concurrency": 4,
+    "num_requests": 20,
+    "output_len": 512,
+    "tpf_single": 1.9432,
+    "tps": 697.66,
+    "total_output_tokens": 10240,
+    "elapsed_seconds": 14.68
+  },
+  {
+    "label": "SDAR thr=0.5",
+    "algorithm": "LowConfidence",
+    "threshold": 0.5,
+    "dataset": "math",
+    "concurrency": 4,
+    "num_requests": 20,
+    "output_len": 512,
+    "tpf_single": 1.9286,
+    "tps": 713.19,
+    "total_output_tokens": 10240,
+    "elapsed_seconds": 14.36
+  },
+  {
+    "label": "SDAR thr=0.7",
+    "algorithm": "LowConfidence",
+    "threshold": 0.7,
+    "dataset": "math",
+    "concurrency": 4,
+    "num_requests": 20,
+    "output_len": 512,
+    "tpf_single": 1.769,
+    "tps": 658.96,
+    "total_output_tokens": 10240,
+    "elapsed_seconds": 15.54
+  },
+  {
+    "label": "SDAR thr=0.9",
+    "algorithm": "LowConfidence",
+    "threshold": 0.9,
+    "dataset": "math",
+    "concurrency": 4,
+    "num_requests": 20,
+    "output_len": 512,
+    "tpf_single": 1.0985,
+    "tps": 440.77,
+    "total_output_tokens": 10240,
+    "elapsed_seconds": 23.23
+  }
+]

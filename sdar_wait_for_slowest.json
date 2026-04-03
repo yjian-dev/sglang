@@ -1,0 +1,59 @@
+{
+  "tpf_cache": {
+    "Write a Python function to find the longest common subsequen": 0.8003120124804992,
+    "Count from 1 to 50.": 0.8894645941278065,
+    "Explain how photosynthesis works to a 10-year-old.": 0.9081272084805654,
+    "List the first 20 prime numbers.": 1.2261904761904763,
+    "What is 127 * 453? Show your step-by-step calculation.": 1.3716577540106951,
+    "Solve the quadratic equation: 3x^2 - 7x + 2 = 0.": 0.9097345132743363,
+    "Tell me about the history of artificial intelligence in a fe": 1.7109634551495017,
+    "Implement merge sort in Python and explain its time complexi": 1.5833333333333333,
+    "Describe the process of making bread from scratch.": 1.2907268170426065,
+    "What are the benefits and drawbacks of remote work?": 1.2536585365853659,
+    "Explain the concept of blockchain in simple terms.": 1.2754342431761787,
+    "Describe the water cycle and its importance to life on Earth": 0.8192,
+    "What are the main differences between Python and JavaScript?": 0.9017543859649123
+  },
+  "batches": [
+    {
+      "name": "8x slow",
+      "avg_tpf": 0.8003,
+      "min_tpf": 0.8003,
+      "max_tpf": 0.8003,
+      "batch_tps": 1084.2,
+      "has_slow": true
+    },
+    {
+      "name": "1 slow + 7 med-slow",
+      "avg_tpf": 0.8853,
+      "min_tpf": 0.8003,
+      "max_tpf": 0.9081,
+      "batch_tps": 589.8,
+      "has_slow": true
+    },
+    {
+      "name": "1 slow + 7 medium",
+      "avg_tpf": 1.1302,
+      "min_tpf": 0.8003,
+      "max_tpf": 1.3717,
+      "batch_tps": 630.0,
+      "has_slow": true
+    },
+    {
+      "name": "1 slow + 7 fast",
+      "avg_tpf": 1.2044,
+      "min_tpf": 0.8003,
+      "max_tpf": 1.711,
+      "batch_tps": 567.6,
+      "has_slow": true
+    },
+    {
+      "name": "8x fast (no slow)",
+      "avg_tpf": 1.3183,
+      "min_tpf": 0.8192,
+      "max_tpf": 1.711,
+      "batch_tps": 560.0,
+      "has_slow": false
+    }
+  ]
+}
