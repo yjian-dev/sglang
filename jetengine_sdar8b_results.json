@@ -1,0 +1,51 @@
+[
+  {
+    "bs": 1,
+    "tps": 159.6,
+    "elapsed": 1.78,
+    "total_tok": 284,
+    "per_req_tok": 284.0
+  },
+  {
+    "bs": 2,
+    "tps": 304.0,
+    "elapsed": 1.87,
+    "total_tok": 568,
+    "per_req_tok": 284.0
+  },
+  {
+    "bs": 4,
+    "tps": 594.3,
+    "elapsed": 1.91,
+    "total_tok": 1136,
+    "per_req_tok": 284.0
+  },
+  {
+    "bs": 8,
+    "tps": 1139.5,
+    "elapsed": 1.99,
+    "total_tok": 2272,
+    "per_req_tok": 284.0
+  },
+  {
+    "bs": 16,
+    "tps": 1944.7,
+    "elapsed": 2.34,
+    "total_tok": 4544,
+    "per_req_tok": 284.0
+  },
+  {
+    "bs": 32,
+    "tps": 3132.4,
+    "elapsed": 2.9,
+    "total_tok": 9088,
+    "per_req_tok": 284.0
+  },
+  {
+    "bs": 64,
+    "tps": 4247.2,
+    "elapsed": 4.28,
+    "total_tok": 18176,
+    "per_req_tok": 284.0
+  }
+]

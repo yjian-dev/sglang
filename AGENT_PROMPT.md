@@ -1,117 +1,170 @@
-# Agent Prompt — COLM Throughput Benchmark
+# Agent Prompt — DreamShift vs SDAR Demo
 
 ## Role
-You are a benchmark agent. You run throughput benchmarks using tore-speed-eval across 5 models, 3 datasets, and 7 batch sizes. You record results in `docs/benchmark_results.md`.
+You are a demo engineer building a side-by-side comparison demo of DreamShift (our ISD method on SGLang) vs SDAR baseline (on JetEngine). The demo will be screen-recorded as a video for a paper/presentation, showing our throughput advantage at various batch sizes.
 
-## 5 Models (already launched on GPUs)
+## Goal
+Create a polished terminal-based demo that:
+1. Runs MBPP coding problems through both engines
+2. Shows real-time streaming output and TPS comparison
+3. Produces throughput comparison data and visualizations
 
-| Port | GPU | Label | Model | Backend |
-|------|-----|-------|-------|---------|
-| 39001 | 4 | AR | Qwen/Qwen3-8B | sglang (our branch) |
-| 39002 | 1 | DFlash s1d16 | Qwen/Qwen3-8B + z-lab/Qwen3-8B-DFlash-b16 (steps=1 draft=16) | dflash env (PR #20547) |
-| 39003 | 2 | EAGLE3 | Qwen/Qwen3-8B + Tengyunw/qwen3_8b_eagle3 (steps=3 topk=1 draft=4) | dflash env (PR #20547) |
-| 39004 | 3 | Ours N=4 LoRA | b3-allmasked-causal + lora128_epoch2, DreamShiftBlockN gen_bs=4 block=7 | sglang (our branch) |
-| 38001 | 0 | Ours N=4 b2 | b2-allmasked-causal_fixed2_cont, DreamShiftBlockN gen_bs=4 block=7 | sglang (our branch) |
+## Models & Engines
 
-## Server Launch Commands (if servers are down)
-
+### DreamShift N=4 (Ours) — SGLang server
+- Checkpoint: `/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b3-causal-from-b2amc_fixed2_cont`
+- Architecture: SDARForCausalLM (same 8B param count as baseline)
+- Algorithm: `DreamShiftBlockN` with `dreamshift_blockN4_config.yaml`
+- Config: block_size=7, gen_block_size=4, temperature=1.0, top_k=50, top_p=0.95, use_spec_verify=true
+- Launch (use GPU 0):
 ```bash
-source /home/yjian/miniconda3/etc/profile.d/conda.sh && conda activate sglang
-export PATH=/home/yjian/miniconda3/envs/sglang/bin:/home/yjian/miniconda3/envs/dflash/bin:/usr/local/cuda-12.9/bin:$PATH
+export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-12.9
-SGLANG_P=/home/yjian/miniconda3/envs/sglang/bin/python
-DFLASH_P=/home/yjian/miniconda3/envs/dflash/bin/python
+export PYTHONPATH=/data/yjian/code/sglang/python:$PYTHONPATH
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+    --model-path /data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b3-causal-from-b2amc_fixed2_cont \
+    --trust-remote-code --tp-size 1 --dtype bfloat16 \
+    --mem-fraction-static 0.85 --max-running-requests 24 \
+    --attention-backend flashinfer --dllm-algorithm DreamShiftBlockN \
+    --dllm-algorithm-config dreamshift_blockN4_config.yaml --port 30000
+```
+- API: standard OpenAI chat completions at `http://localhost:30000/v1/chat/completions`
+- Supports streaming (`"stream": true`)
+- Wait for server health: `curl http://localhost:30000/health`
 
-# AR (GPU 4)
-CUDA_VISIBLE_DEVICES=4 nohup $SGLANG_P -m sglang.launch_server --model-path Qwen/Qwen3-8B --tp-size 1 --dtype bfloat16 --mem-fraction-static 0.85 --max-running-requests 64 --port 39001 > /dev/null 2>&1 &
+### SDAR Baseline — JetEngine (offline batch engine)
+- Model: `/data/shared/huggingface/SDAR-8B-Chat` (standard JetLM/SDAR-8B-Chat)
+- mask_token_id: 151669, block_length: 4
+- JetEngine installed at `/data/yjian/code/JetEngine` (already `pip install -e`'d in sglang env)
+- IMPORTANT: JetEngine is an OFFLINE batch engine, NOT a server. You call `llm.generate()` directly.
+- IMPORTANT: JetEngine requires `torchrun --nproc_per_node=1` to initialize torch.distributed.
+- Use GPU 1: `CUDA_VISIBLE_DEVICES=1`
+- API:
+```python
+from jetengine import LLM, SamplingParams
+llm = LLM(model_path, enforce_eager=False, tensor_parallel_size=1,
+          mask_token_id=151669, block_length=4, max_num_seqs=128,
+          max_model_len=4096, gpu_memory_utilization=0.85)
+sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0,
+    max_tokens=2048, remasking_strategy="low_confidence_dynamic",
+    dynamic_threshold=0.9, block_length=4, denoising_steps=4)
+outputs = llm.generate(prompt_ids_list, sampling_params)
+# Each output: {'text': str, 'token_ids': list}
+```
+- For tokenization: both models use Qwen-based tokenizer with `enable_thinking=True` in chat template
+- Existing benchmark data (SDAR-8B-Chat, 1 GPU H100, max_tokens=256):
+  bs=1: 160, bs=2: 304, bs=4: 594, bs=8: 1140, bs=16: 1945, bs=32: 3132, bs=64: 4247 tok/s
 
-# DFlash s1d16 (GPU 1)
-CUDA_VISIBLE_DEVICES=1 SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_DFLASH_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 nohup $DFLASH_P -m sglang.launch_server --model-path Qwen/Qwen3-8B --speculative-algorithm DFLASH --speculative-draft-model-path z-lab/Qwen3-8B-DFlash-b16 --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 16 --tp-size 1 --dtype bfloat16 --attention-backend fa3 --mem-fraction-static 0.85 --trust-remote-code --port 39002 --max-running-requests 64 > /dev/null 2>&1 &
-
-# EAGLE3 (GPU 2)
-CUDA_VISIBLE_DEVICES=2 nohup $DFLASH_P -m sglang.launch_server --model-path Qwen/Qwen3-8B --speculative-algorithm EAGLE3 --speculative-draft-model-path Tengyunw/qwen3_8b_eagle3 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp-size 1 --dtype bfloat16 --mem-fraction-static 0.85 --trust-remote-code --port 39003 --max-running-requests 64 > /dev/null 2>&1 &
-
-# Ours N=4 LoRA (GPU 3)
-CUDA_VISIBLE_DEVICES=3 nohup $SGLANG_P -m sglang.launch_server --model-path /data/cxu/dllm-distillation/training/model/Qwen3-8B-b3-allmasked-causal --trust-remote-code --tp-size 1 --dtype bfloat16 --mem-fraction-static 0.85 --max-running-requests 64 --attention-backend flashinfer --dllm-algorithm DreamShiftBlockN --dllm-algorithm-config dreamshift_blockN4_config.yaml --enable-lora --lora-paths "b3lora=/data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b3-causal-from-b2amc-lora128_fixed2_epoch2" --max-lora-rank 128 --port 39004 > /dev/null 2>&1 &
-
-# Ours N=4 b2 (GPU 0)
-CUDA_VISIBLE_DEVICES=0 nohup $SGLANG_P -m sglang.launch_server --model-path /data/cxu/keep/dllm_experiments/sdar_qwen3_8b_dreamshift_ar_b2-allmasked-causal_fixed2_cont --trust-remote-code --tp-size 1 --dtype bfloat16 --mem-fraction-static 0.85 --max-running-requests 64 --attention-backend flashinfer --dllm-algorithm DreamShiftBlockN --dllm-algorithm-config dreamshift_blockN4_config.yaml --port 38001 > /dev/null 2>&1 &
+## Input Data
+Use MBPP sanitized test set:
+```python
+from datasets import load_dataset
+ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+# Each item has: prompt, code, test_list, task_id
+```
+Format prompts like:
+```
+You are an expert Python programmer. Here is your task:
+{prompt}
+Your code should pass these tests:
+{test_list joined by newlines}
 ```
 
-## Datasets (jsonl files, create if missing)
+## Fairness Requirements (CRITICAL)
+- Both use TP=1, single GPU, bfloat16, NO quantization
+- Both use temperature=1.0, top_p=0.95 (matching paper settings)
+- Both process the EXACT same prompts with the same max_tokens
+- SDAR-8B-Chat and our checkpoint are both SDAR architecture, same param count (~8B)
+- Do NOT use any tricks to make one faster (no batching tricks, no special flags)
 
-```bash
-# MBPP (257 problems)
-python3 -c "
-from datasets import load_dataset; import json
-ds = load_dataset('google-research-datasets/mbpp', 'sanitized', split='test')
-with open('/tmp/mbpp.jsonl', 'w') as f:
-    for d in ds: f.write(json.dumps({'prompt': d['prompt']}) + '\n')
-print(f'MBPP: {len(ds)}')
-"
+## Demo Design
 
-# MATH-500 (500 problems)
-python3 -c "
-from datasets import load_dataset; import json
-ds = load_dataset('HuggingFaceH4/MATH-500', split='test')
-with open('/tmp/math500.jsonl', 'w') as f:
-    for d in ds: f.write(json.dumps({'prompt': d['problem']}) + '\n')
-print(f'MATH-500: {len(ds)}')
-"
+The demo is a **live TPS traffic monitor** — like a network bandwidth graph — that runs both
+engines simultaneously at a fixed concurrency and records per-second throughput over time.
 
-# LMSYS-Chat (182 problems)
-python3 -c "
-from datasets import load_dataset; import json
-ds = load_dataset('lmsys/lmsys-chat-1m', split='train[:200]')
-with open('/tmp/lmsys_chat.jsonl', 'w') as f:
-    for d in ds:
-        msg = next((t['content'] for t in d['conversation'] if t['role'] == 'user'), None)
-        if msg and len(msg) > 10: f.write(json.dumps({'prompt': msg}) + '\n')
-print('LMSYS done')
-"
+### Core Concept
+- Fix concurrency (e.g., 32) — always keep 32 requests in-flight
+- Use MBPP problems as input, max_tokens=2048, temperature=1.0, top_p=0.95
+- As requests complete, immediately send new ones to maintain concurrency
+- Record tokens generated per second for the entire run duration (~60-120 seconds)
+- Plot both curves on the same chart — our DreamShift curve climbs high, SDAR stays lower
+
+### Component 1: Data Collection (scripts/demo/collect_tps_timeseries.py)
+
+**DreamShift (SGLang server):**
+- Use `tore-speed-eval` style: send streaming requests via aiohttp with fixed concurrency
+- As each streaming chunk arrives, record timestamp + token count
+- Aggregate into per-second buckets → TPS time series
+- OR: poll `http://localhost:30000/get_server_info` → `last_gen_throughput` every 0.5s
+  (this is the easiest approach — server already tracks this metric)
+- `tore-speed-eval` is installed: `/home/yjian/miniconda3/envs/sglang/bin/tore-speed-eval`
+  You can also just use it directly with `--traffic_pattern burst --concurrency 32`
+  and parse the streaming output for per-second data.
+
+**SDAR (JetEngine):**
+- JetEngine is offline batch — it processes all prompts together, no streaming
+- Approach: send batches of 32 prompts, measure total time per batch
+- tokens_per_batch / time_per_batch = TPS for that interval
+- Run multiple sequential batches to build a time series
+- This runs as a separate process via `torchrun` on GPU 1
+
+**Output:** JSON file with `{dreamshift: [{time, tps}, ...], sdar: [{time, tps}, ...]}`
+
+### Component 2: Live TPS Area Chart (scripts/demo/live_tps_chart.py) [HIGH PRIORITY]
+
+Renders the traffic monitor visualization. Reference: `Screenshot 2026-04-05 at 4.25.32 PM.png`
+
+**Visual style:**
+- Dark background (dark navy/black #0a0e27)
+- Filled area chart with semi-transparent gradient fill under the curve
+- DreamShift: bright cyan/blue (#00d4ff) with blue gradient fill
+- SDAR baseline: dim red/orange (#ff4444) with subtle fill
+- Y-axis: tokens/second, X-axis: time (seconds)
+- Large bold text overlay: "Batch Size: 32" and "Throughput: X,XXX tokens/s"
+- Dotted grid lines, subtle
+- Title: "Large Batch" or "Throughput Comparison"
+
+**Two rendering modes:**
+1. **Animated (for video):** matplotlib FuncAnimation → save as MP4 or GIF
+   - Chart builds up over time as data streams in
+   - Final frame holds for a few seconds showing total throughput
+2. **Static (for presentation):** single PNG with both curves overlaid
+
+### Component 3: Single Request Demo (scripts/demo/stream_compare.py) [NICE TO HAVE]
+Side-by-side terminal view of one MBPP problem showing text generation.
+Lower priority than the TPS chart.
+
+### Component 4: run_demo.sh
+One-click script:
+1. Start DreamShift server on GPU 0
+2. Wait for health
+3. Run data collection for both engines in parallel
+4. Generate visualization
+5. Print summary
+
+## File Structure
+```
+scripts/demo/
+  collect_tps_timeseries.py    # Collect per-second TPS data from both engines
+  collect_jetengine_tps.py     # JetEngine worker (runs via torchrun on GPU 1)
+  live_tps_chart.py            # Render the traffic monitor chart (animated + static)
+  stream_compare.py            # Single-request side-by-side [nice to have]
+  run_demo.sh                  # One-click launcher
+  results/                     # Output directory
 ```
 
-## Benchmark Command Template
-
+## Environment Setup
 ```bash
-TORE=/home/yjian/miniconda3/envs/sglang/bin/tore-speed-eval
-
-$TORE --provider sglang --base_url "http://localhost:$PORT/v1" \
-    --model_name "test" --tokenizer_name "Qwen/Qwen3-8B" \
-    --dataset_type jsonl --jsonl_input_path $JSONL_PATH \
-    --jsonl_dataset_column_name prompt --jsonl_convert_to_chat_request_format true \
-    --num_examples $N --max_tokens 2048 \
-    --traffic_pattern burst --concurrency $BS \
-    --chat True --stream True --temperature 1.0 --top_p 0.95 \
-    $LORA_ARGS \
-    --evaluation_output_path "$OUTDIR/${DS}_${MODEL}_bs${BS}.csv"
-```
-
-For N=4 LoRA, add: `--lora_names b3lora --lora_ratio 1.0`
-
-## num_examples per batch size
-- bs=1,2: 50 examples
-- bs=4: 100 examples (or all if dataset < 100)
-- bs>=8: ALL examples from dataset
-
-## Batch sizes to test
-1, 2, 4, 8, 16, 32, 64
-
-## Critical Rules
-1. **Before starting**: verify all 5 servers are healthy (`curl http://localhost:$PORT/health`)
-2. **Before starting**: verify AR per-req TPS < 150 at bs=1 (send 5 test requests)
-3. **All 5 models run in PARALLEL** for each (dataset, bs) combination — saves time
-4. **Check decode length = 2048.0 ± 0.0** — if not, results are invalid (requests ended early)
-5. **Check failed = 0** — if any failures, server may have crashed, restart and rerun
-6. **If N=4 b2 crashes** on a dataset at bs=64, it's likely OOM from long inputs. Note as "OOM" in results.
-7. **Record results in PLAN.md** after each dataset completes
-8. **Final results** go into `docs/benchmark_results.md`
-
-## Output Format
-Parse CSV: `summary_job_level_tps` (Job TPS) and `user_tps_mean` (Per-Req TPS)
-
-## Environment
-```bash
-export PATH=/home/yjian/miniconda3/envs/sglang/bin:/home/yjian/miniconda3/envs/dflash/bin:/usr/local/cuda-12.9/bin:$PATH
+export PATH=/home/yjian/miniconda3/envs/sglang/bin:/usr/local/cuda-12.9/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-12.9
+export PYTHONPATH=/data/yjian/code/sglang/python:$PYTHONPATH
 ```
+
+## Constraints
+- All scripts go in `scripts/demo/` directory
+- Always update PLAN.md with progress after completing each task
+- Test each component individually before integrating
+- If server fails, check logs and fix before proceeding
+- GPU allocation: GPU 0 = DreamShift, GPU 1 = JetEngine SDAR
+- The demo must be runnable from terminal (for screen recording on remote server)
+- Keep output clean and visually appealing for recording

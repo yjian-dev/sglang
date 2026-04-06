@@ -1,0 +1,714 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1775468577129,
+  "projectRoot": "/data/yjian/code/sglang",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "assets",
+      "docs",
+      "examples",
+      "scripts",
+      "test"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "3rdparty": {
+      "path": "3rdparty",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775468576958,
+      "keyFiles": []
+    },
+    "ablation_results_20260326_190820": {
+      "path": "ablation_results_20260326_190820",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1775468576959,
+      "keyFiles": [
+        "0_naive_server.log",
+        "1_cuda_graph_server.log",
+        "2_decode_loop_server.log",
+        "3_argmax_proposals_server.log",
+        "4_fused_verify_server.log"
+      ]
+    },
+    "ablation_results_20260326_191513": {
+      "path": "ablation_results_20260326_191513",
+      "purpose": null,
+      "fileCount": 18,
+      "lastAccessed": 1775468576961,
+      "keyFiles": [
+        "0_naive_c1.log",
+        "0_naive_c32.log",
+        "0_naive_c8.log",
+        "1_cuda_graph_c1.log",
+        "1_cuda_graph_c32.log"
+      ]
+    },
+    "ablation_results_20260326_193536": {
+      "path": "ablation_results_20260326_193536",
+      "purpose": null,
+      "fileCount": 25,
+      "lastAccessed": 1775468576963,
+      "keyFiles": [
+        "0_naive_c1.log",
+        "0_naive_c32.log",
+        "0_naive_c8.log",
+        "0_naive_server.log",
+        "1_cuda_graph_c1.log"
+      ]
+    },
+    "ablation_results_attn_20260326_194758": {
+      "path": "ablation_results_attn_20260326_194758",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775468576965,
+      "keyFiles": [
+        "paged_only_server.log",
+        "ragged_cascade_server.log"
+      ]
+    },
+    "ablation_results_attn_20260326_200408": {
+      "path": "ablation_results_attn_20260326_200408",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1775468576968,
+      "keyFiles": [
+        "paged_only_c1.log",
+        "paged_only_c32.log",
+        "paged_only_c8.log",
+        "paged_only_server.log",
+        "ragged_cascade_c1.log"
+      ]
+    },
+    "ablation_results_cascade_naive": {
+      "path": "ablation_results_cascade_naive",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1775468576970,
+      "keyFiles": [
+        "c1.log",
+        "c32.log",
+        "c8.log",
+        "server.log"
+      ]
+    },
+    "ablation_step_timing_20260326_231108": {
+      "path": "ablation_step_timing_20260326_231108",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1775468576972,
+      "keyFiles": [
+        "cascade_server.log",
+        "paged_c1_loops.txt",
+        "paged_c1_profile.txt",
+        "paged_server.log"
+      ]
+    },
+    "agent_logs": {
+      "path": "agent_logs",
+      "purpose": null,
+      "fileCount": 208,
+      "lastAccessed": 1775468576975,
+      "keyFiles": [
+        "agent_iter_10_1a9084.log",
+        "agent_iter_10_3d227c.log",
+        "agent_iter_10_8429cd.log",
+        "agent_iter_10_c6fe0d.log",
+        "agent_iter_10_e495fe.log"
+      ]
+    },
+    "ar_tore_20260328_000409": {
+      "path": "ar_tore_20260328_000409",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468576977,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "assets": {
+      "path": "assets",
+      "purpose": "Static assets",
+      "fileCount": 5,
+      "lastAccessed": 1775468576979,
+      "keyFiles": [
+        "AzureLLMInferenceTrace_code_1week.csv",
+        "logo.png",
+        "logo.svg",
+        "logo_square.png",
+        "logo_square.svg"
+      ]
+    },
+    "bench_results": {
+      "path": "bench_results",
+      "purpose": null,
+      "fileCount": 46,
+      "lastAccessed": 1775468576982,
+      "keyFiles": [
+        "bench_5rounds_3servers.png",
+        "bench_5rounds_4servers.png",
+        "bench_5rounds_5servers.png",
+        "bench_5rounds_all.png",
+        "bench_aime.png"
+      ]
+    },
+    "benchmark": {
+      "path": "benchmark",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775468576984,
+      "keyFiles": []
+    },
+    "benchmark_plots": {
+      "path": "benchmark_plots",
+      "purpose": null,
+      "fileCount": 27,
+      "lastAccessed": 1775468576986,
+      "keyFiles": [
+        "colm_speedup_over_ar.png",
+        "colm_tvl_all.png",
+        "colm_tvl_lmsys_chat.png",
+        "colm_tvl_math_500.png",
+        "colm_tvl_mbpp.png"
+      ]
+    },
+    "colm_benchmark_package": {
+      "path": "colm_benchmark_package",
+      "purpose": null,
+      "fileCount": 14,
+      "lastAccessed": 1775468576988,
+      "keyFiles": [
+        "README.md",
+        "colm_speedup_over_ar.png",
+        "colm_tvl_all.png",
+        "colm_tvl_lmsys_chat.png",
+        "colm_tvl_math_500.png"
+      ]
+    },
+    "concurrent_bench_20260328_223614": {
+      "path": "concurrent_bench_20260328_223614",
+      "purpose": null,
+      "fileCount": 22,
+      "lastAccessed": 1775468576990,
+      "keyFiles": [
+        "server_ar.log",
+        "server_dflash_s1d16.log",
+        "server_dflash_s1d4.log",
+        "server_eagle3.log",
+        "server_eagle3_v2.log"
+      ]
+    },
+    "dflash85_tore_20260328_012635": {
+      "path": "dflash85_tore_20260328_012635",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468576992,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "dflash_bench_20260327_185853": {
+      "path": "dflash_bench_20260327_185853",
+      "purpose": null,
+      "fileCount": 42,
+      "lastAccessed": 1775468576994,
+      "keyFiles": [
+        "aime25_bs1.log",
+        "aime25_bs16.log",
+        "aime25_bs2.log",
+        "aime25_bs32.log",
+        "aime25_bs4.log"
+      ]
+    },
+    "dflash_fa4_20260327_212828": {
+      "path": "dflash_fa4_20260327_212828",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1775468576996,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "dflash_s1d4_tore_20260328_131259": {
+      "path": "dflash_s1d4_tore_20260328_131259",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468576999,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "dflash_s3d4_tore_20260328_021959": {
+      "path": "dflash_s3d4_tore_20260328_021959",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577001,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "dflash_s4d5_tore_20260328_150730": {
+      "path": "dflash_s4d5_tore_20260328_150730",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577004,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "dflash_tore_20260327_194337": {
+      "path": "dflash_tore_20260327_194337",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775468577006,
+      "keyFiles": []
+    },
+    "dflash_tore_20260327_194347": {
+      "path": "dflash_tore_20260327_194347",
+      "purpose": null,
+      "fileCount": 14,
+      "lastAccessed": 1775468577008,
+      "keyFiles": [
+        "aime25_bs1.log",
+        "aime25_bs16.log",
+        "aime25_bs2.log",
+        "aime25_bs32.log",
+        "aime25_bs4.log"
+      ]
+    },
+    "dflash_tore_20260327_195433": {
+      "path": "dflash_tore_20260327_195433",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577010,
+      "keyFiles": [
+        "aime25_bs1.log",
+        "aime25_bs16.log",
+        "aime25_bs2.log",
+        "aime25_bs32.log",
+        "aime25_bs4.log"
+      ]
+    },
+    "dflash_tore_20260327_203044": {
+      "path": "dflash_tore_20260327_203044",
+      "purpose": null,
+      "fileCount": 76,
+      "lastAccessed": 1775468577013,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "docker": {
+      "path": "docker",
+      "purpose": null,
+      "fileCount": 12,
+      "lastAccessed": 1775468577015,
+      "keyFiles": [
+        "Dockerfile",
+        "compose.yaml",
+        "diffusion.Dockerfile",
+        "gateway.Dockerfile",
+        "k8s-sglang-distributed-sts.yaml"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 20,
+      "lastAccessed": 1775468577017,
+      "keyFiles": [
+        "2602.06072v1.pdf",
+        "Makefile",
+        "README.md",
+        "benchmark_results.md",
+        "benchmark_settings.md"
+      ]
+    },
+    "eagle3_85_tore_20260328_015644": {
+      "path": "eagle3_85_tore_20260328_015644",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577019,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "eagle3_tore_20260327_215052": {
+      "path": "eagle3_tore_20260327_215052",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775468577021,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs1_v2.log"
+      ]
+    },
+    "eagle3_tore_20260327_220728": {
+      "path": "eagle3_tore_20260327_220728",
+      "purpose": null,
+      "fileCount": 38,
+      "lastAccessed": 1775468577023,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs2_v2.log",
+        "server_bs32.log"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 0,
+      "lastAccessed": 1775468577025,
+      "keyFiles": []
+    },
+    "lora_tore_20260327_233603": {
+      "path": "lora_tore_20260327_233603",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577027,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "n4_b2cont_20260329_213530": {
+      "path": "n4_b2cont_20260329_213530",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1775468577030,
+      "keyFiles": [
+        "server_bs1.log"
+      ]
+    },
+    "n4_b2cont_20260329_213733": {
+      "path": "n4_b2cont_20260329_213733",
+      "purpose": null,
+      "fileCount": 37,
+      "lastAccessed": 1775468577032,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs32_v2.log"
+      ]
+    },
+    "n4_lora_tore_20260329_195855": {
+      "path": "n4_lora_tore_20260329_195855",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1775468577034,
+      "keyFiles": [
+        "server_bs1.log"
+      ]
+    },
+    "n4_lora_tore_20260329_200754": {
+      "path": "n4_lora_tore_20260329_200754",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577036,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "n4_lora_v2_20260329_203833": {
+      "path": "n4_lora_v2_20260329_203833",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577038,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "n4_tore_20260328_153945": {
+      "path": "n4_tore_20260328_153945",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577040,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "nonlora_tore_20260328_004200": {
+      "path": "nonlora_tore_20260328_004200",
+      "purpose": null,
+      "fileCount": 35,
+      "lastAccessed": 1775468577044,
+      "keyFiles": [
+        "server_bs1.log",
+        "server_bs16.log",
+        "server_bs2.log",
+        "server_bs32.log",
+        "server_bs4.log"
+      ]
+    },
+    "output_ifeval": {
+      "path": "output_ifeval",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775468577046,
+      "keyFiles": [
+        "ifeval_details.json",
+        "ifeval_summary.json"
+      ]
+    },
+    "python": {
+      "path": "python",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1775468577048,
+      "keyFiles": [
+        "pyproject.toml",
+        "pyproject_cpu.toml",
+        "pyproject_npu.toml",
+        "pyproject_other.toml",
+        "pyproject_xpu.toml"
+      ]
+    },
+    "replay_dumps": {
+      "path": "replay_dumps",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775468577050,
+      "keyFiles": []
+    },
+    "results": {
+      "path": "results",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775468577052,
+      "keyFiles": []
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 52,
+      "lastAccessed": 1775468577054,
+      "keyFiles": [
+        "ablation_infra.py",
+        "bench_attn_step_timing.sh",
+        "bench_concurrent_throughput.py",
+        "bench_dflash_full.sh",
+        "bench_dflash_tore.sh"
+      ]
+    },
+    "sgl-kernel": {
+      "path": "sgl-kernel",
+      "purpose": null,
+      "fileCount": 17,
+      "lastAccessed": 1775468577056,
+      "keyFiles": [
+        "CMakeLists.txt",
+        "Dockerfile",
+        "LICENSE",
+        "Makefile",
+        "README.md"
+      ]
+    },
+    "sgl-model-gateway": {
+      "path": "sgl-model-gateway",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1775468577059,
+      "keyFiles": [
+        "Cargo.toml",
+        "Makefile",
+        "README.md",
+        "build.rs",
+        "pytest.ini"
+      ]
+    },
+    "test": {
+      "path": "test",
+      "purpose": "Test files",
+      "fileCount": 4,
+      "lastAccessed": 1775468577062,
+      "keyFiles": [
+        "README.md",
+        "pytest.ini",
+        "run_suite.py",
+        "run_suite_nightly.py"
+      ]
+    },
+    "trace_ts": {
+      "path": "trace_ts",
+      "purpose": null,
+      "fileCount": 61,
+      "lastAccessed": 1775468577065,
+      "keyFiles": [
+        "5m_AR.json",
+        "5m_DFlash.json",
+        "5m_EAGLE3.json",
+        "5m_LoRA.json",
+        "AR.json"
+      ]
+    },
+    "examples/assets": {
+      "path": "examples/assets",
+      "purpose": "Static assets",
+      "fileCount": 2,
+      "lastAccessed": 1775468577104,
+      "keyFiles": [
+        "example_image.png"
+      ]
+    },
+    "sgl-model-gateway/examples": {
+      "path": "sgl-model-gateway/examples",
+      "purpose": "Example code",
+      "fileCount": 0,
+      "lastAccessed": 1775468577125,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "scripts/demo/live_tps_chart.py",
+      "accessCount": 16,
+      "lastAccessed": 1775501812547,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/collect_tps_timeseries.py",
+      "accessCount": 7,
+      "lastAccessed": 1775501326508,
+      "type": "file"
+    },
+    {
+      "path": "PLAN.md",
+      "accessCount": 6,
+      "lastAccessed": 1775501764324,
+      "type": "file"
+    },
+    {
+      "path": "AGENT_PROMPT.md",
+      "accessCount": 4,
+      "lastAccessed": 1775468877470,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/collect_jetengine_tps.py",
+      "accessCount": 4,
+      "lastAccessed": 1775501326940,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/run_demo.sh",
+      "accessCount": 4,
+      "lastAccessed": 1775501710085,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/results/tps_test.png",
+      "accessCount": 2,
+      "lastAccessed": 1775501179629,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/results/tps_comparison.png",
+      "accessCount": 2,
+      "lastAccessed": 1775501702206,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/test_jetengine.py",
+      "accessCount": 1,
+      "lastAccessed": 1775469405111,
+      "type": "file"
+    },
+    {
+      "path": "python/sglang",
+      "accessCount": 1,
+      "lastAccessed": 1775469726306,
+      "type": "directory"
+    },
+    {
+      "path": "scripts/demo/results/dreamshift_tps_test.json",
+      "accessCount": 1,
+      "lastAccessed": 1775501332776,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/results/sdar_tps_test.json",
+      "accessCount": 1,
+      "lastAccessed": 1775501333272,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

@@ -1,42 +1,38 @@
 # Success Conditions
 
 ## Criteria
-1. All 6 result tables in PLAN.md are complete (no "— " remaining in data cells)
-2. AR per-req TPS is < 150 at all batch sizes
-3. All runs have 0 failed requests
-4. Final tables are written to docs/benchmark_results.md under a new "## Table 6: Comprehensive Throughput (tore-speed-eval)" section
+1. DreamShift SGLang server runs on GPU 0 and produces correct code output for MBPP problems
+2. JetEngine SDAR runs on GPU 1 and produces correct code output for the same MBPP problems
+3. Throughput benchmark data collected for both at bs=1,4,8,16,32,64 — saved to JSON
+4. A comparison plot (PNG) showing TPS vs batch_size for both engines exists
+5. A side-by-side streaming demo script exists and runs cleanly
+6. DreamShift shows meaningful speedup over SDAR at large batch sizes (bs>=16)
+7. All comparisons are fair: same TP=1, same GPU type, same dtype, same prompts, same max_tokens
 
 ## Test Commands
+The following commands must all pass (exit code 0):
+
 ```bash
-# No dashes remaining in result tables
-! grep "| — |" PLAN.md
+# Check demo scripts exist
+test -f scripts/demo/bench_comparison.py
+test -f scripts/demo/bench_jetengine_worker.py
+test -f scripts/demo/plot_comparison.py
 
-# AR per-req should be < 150 everywhere
+# Check results exist
+test -f scripts/demo/results/throughput_comparison.json
+test -f scripts/demo/results/throughput_comparison.png
+
+# Check results have data for both engines
 python3 -c "
-import re
-with open('PLAN.md') as f:
-    text = f.read()
-# Find AR column values in Per-Req tables
-for line in text.split('\n'):
-    if line.startswith('|') and '| AR |' not in line and '|--' not in line:
-        cols = [c.strip() for c in line.split('|')]
-        if len(cols) > 2 and cols[1].isdigit():  # bs column
-            try:
-                ar_val = float(cols[2])
-                assert ar_val < 160, f'AR per-req {ar_val} >= 160 at bs={cols[1]}'
-            except ValueError:
-                pass
-print('AR sanity check passed')
+import json
+data = json.load(open('scripts/demo/results/throughput_comparison.json'))
+assert 'dreamshift' in data or 'DreamShift' in str(data), 'Missing DreamShift data'
+assert 'sdar' in data or 'SDAR' in str(data) or 'jetengine' in str(data), 'Missing SDAR data'
+print('Results validated OK')
 "
-
-# docs/benchmark_results.md has Table 6
-grep -q "Table 6" docs/benchmark_results.md
 ```
 
 ## Notes
-- All 5 models must be tested: AR, DFlash s1d16, EAGLE3, Ours N=4 LoRA, Ours N=4 b2
-- All 3 datasets: MBPP (257), MATH-500 (500), LMSYS-Chat (182)
-- All 7 batch sizes: 1, 2, 4, 8, 16, 32, 64
-- Tool: tore-speed-eval, burst mode, max_tokens=2048, thinking mode
-- Common settings: bf16, TP=1, mem_fraction_static=0.85, max_running_requests=64
-- If N=4 b2 crashes at high bs, mark as "OOM" (not a failure)
+- All test commands must exit with code 0 for success
+- The demo should be visually clean enough for screen recording
+- Fairness is paramount — no tricks to inflate numbers

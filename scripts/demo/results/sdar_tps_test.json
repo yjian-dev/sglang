@@ -1,0 +1,49 @@
+{
+  "engine": "sdar",
+  "batch_size": 8,
+  "max_tokens": 512,
+  "num_batches": 3,
+  "tps_series": [
+    {
+      "time": 0.6,
+      "tps": 222.2
+    },
+    {
+      "time": 1.2,
+      "tps": 222.2
+    },
+    {
+      "time": 1.8,
+      "tps": 222.2
+    },
+    {
+      "time": 2.4,
+      "tps": 204.8
+    },
+    {
+      "time": 2.9,
+      "tps": 204.8
+    },
+    {
+      "time": 3.5,
+      "tps": 204.8
+    },
+    {
+      "time": 4.1,
+      "tps": 204.8
+    },
+    {
+      "time": 4.7,
+      "tps": 370.3
+    },
+    {
+      "time": 5.2,
+      "tps": 370.3
+    },
+    {
+      "time": 5.8,
+      "tps": 370.3
+    }
+  ],
+  "total_time": 5.8
+}
