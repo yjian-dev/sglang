@@ -639,38 +639,38 @@
   "hotPaths": [
     {
       "path": "scripts/demo/live_tps_chart.py",
-      "accessCount": 16,
-      "lastAccessed": 1775501812547,
-      "type": "file"
-    },
-    {
-      "path": "scripts/demo/collect_tps_timeseries.py",
-      "accessCount": 7,
-      "lastAccessed": 1775501326508,
+      "accessCount": 17,
+      "lastAccessed": 1775501932243,
       "type": "file"
     },
     {
       "path": "PLAN.md",
-      "accessCount": 6,
-      "lastAccessed": 1775501764324,
+      "accessCount": 11,
+      "lastAccessed": 1775502041524,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/collect_tps_timeseries.py",
+      "accessCount": 8,
+      "lastAccessed": 1775501931471,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/collect_jetengine_tps.py",
+      "accessCount": 5,
+      "lastAccessed": 1775501932088,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/run_demo.sh",
+      "accessCount": 5,
+      "lastAccessed": 1775501932395,
       "type": "file"
     },
     {
       "path": "AGENT_PROMPT.md",
       "accessCount": 4,
       "lastAccessed": 1775468877470,
-      "type": "file"
-    },
-    {
-      "path": "scripts/demo/collect_jetengine_tps.py",
-      "accessCount": 4,
-      "lastAccessed": 1775501326940,
-      "type": "file"
-    },
-    {
-      "path": "scripts/demo/run_demo.sh",
-      "accessCount": 4,
-      "lastAccessed": 1775501710085,
       "type": "file"
     },
     {
@@ -707,6 +707,24 @@
       "path": "scripts/demo/results/sdar_tps_test.json",
       "accessCount": 1,
       "lastAccessed": 1775501333272,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/bench_comparison.py",
+      "accessCount": 1,
+      "lastAccessed": 1775501954994,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/bench_jetengine_worker.py",
+      "accessCount": 1,
+      "lastAccessed": 1775501960336,
+      "type": "file"
+    },
+    {
+      "path": "scripts/demo/plot_comparison.py",
+      "accessCount": 1,
+      "lastAccessed": 1775501969284,
       "type": "file"
     }
   ],
