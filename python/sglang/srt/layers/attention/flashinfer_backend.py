@@ -16,6 +16,11 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -134,7 +139,6 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
-        # For SDAR-style models: use causal attention during STAGING_PREFILL
         self.dllm_causal_prefill = (
             self.dllm_config.causal_prefill if self.dllm_config is not None else False
         )
@@ -151,6 +155,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.page_size = model_runner.page_size
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -249,7 +254,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if is_sm100_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on B200
-            if model_runner.server_args.enable_piecewise_cuda_graph:
+            if not model_runner.server_args.disable_piecewise_cuda_graph:
                 logger.warning(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
                     "due to TMA descriptor initialization issues on B200. "
@@ -514,7 +519,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = False
                 extend_no_prefix = False
             else:
-                use_ragged = not self.enable_deterministic
+                use_ragged = (
+                    not self.enable_deterministic and not is_in_piecewise_cuda_graph()
+                )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
@@ -538,8 +545,6 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             # For SDAR-style dLLM models with causal_prefill: detect whether
             # this extend batch is a STAGING_PREFILL (no mask tokens in input).
-            # Multi-block prefill with a prefix enters the cascade branch
-            # (extend_no_prefix=False) and needs causal attention.
             # The commit pass (after denoising, also no mask tokens) signals
             # dllm_is_commit=True to force bidirectional attention.
             dllm_is_prefill = False
@@ -549,7 +554,7 @@ class FlashInferAttnBackend(AttentionBackend):
             ):
                 is_commit = getattr(forward_batch, "dllm_is_commit", False)
                 if is_commit:
-                    dllm_is_prefill = False  # commit → bidirectional
+                    dllm_is_prefill = False  # commit -> bidirectional
                 else:
                     dllm_is_prefill = not (
                         forward_batch.input_ids == self.dllm_config.mask_id
@@ -788,14 +793,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
-            # Original path — negative prefix_lens for padded entries is OK
-            # (flashinfer handles it correctly; the qo_indptr caching bug was separate)
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens[:bs] - self.dllm_config.block_size,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -807,6 +810,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    @debug_kernel_api
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -877,11 +881,8 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
-            # For SDAR-style dLLM models with causal_prefill=True:
-            # STAGING_PREFILL (extend_no_prefix=True) must use causal attention
-            # to match training where prompt (x0) tokens attend causally.
-            # STAGING_DECODE (extend_no_prefix=False, DLLM_EXTEND) keeps
-            # bidirectional (causal=False) for the current block.
+            # STAGING_PREFILL (extend_no_prefix=True, DLLM_EXTEND) keeps
+            # causal attention to match training where prompt tokens attend causally.
             if (
                 self.dllm_causal_prefill
                 and layer.attn_type == AttentionType.ENCODER_ONLY
@@ -914,8 +915,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 ):
                     # SDAR-style causal_prefill: multi-block STAGING_PREFILL
                     # needs causal attention for the ragged (new-token) part.
-                    # Commit passes are signaled by injecting a mask token,
-                    # so dllm_is_prefill=False and this branch is skipped.
                     causal = True
                 elif self.forward_metadata.dllm_force_causal:
                     # DreamShiftBlock2: force causal within block so that
@@ -947,6 +946,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    @debug_kernel_api
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1130,16 +1130,19 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
+        # Cache encoder_lens on CPU to avoid GPU→CPU transfer per call
+        encoder_lens_cpu = encoder_lens.cpu() if encoder_lens is not None else None
         for wrapper_id in range(2):
             if wrapper_id == 0:
-                # Normal attention
                 paged_kernel_lens = seq_lens
                 kv_start_idx = encoder_lens
+                kv_lens_cpu = seq_lens_cpu
             else:
-                # Cross attention
+                # Cross-attention: attend to encoder tokens only
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
                 seq_lens_sum = encoder_lens.sum().item()
+                kv_lens_cpu = encoder_lens_cpu
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
@@ -1149,7 +1152,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
                 spec_info,
-                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu=kv_lens_cpu,
             )
 
     def call_begin_forward(
@@ -1271,6 +1274,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = attn_backend.page_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1460,18 +1464,16 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            # Reuse kv_indices buffer to avoid per-step allocation
-            needed = paged_kernel_lens_sum + 256
-            _kv_buf = getattr(self, '_kv_indices_buf', None)
-            if _kv_buf is not None and _kv_buf.shape[0] >= needed:
-                kv_indices = _kv_buf
-            else:
-                kv_indices = torch.empty(
-                    max(needed, 8192),  # over-allocate for growth
-                    dtype=torch.int32,
-                    device=req_pool_indices.device,
-                )
-                self._kv_indices_buf = kv_indices
+            # Reserve extra space in kv_indices for a potential piecewise CUDA graph
+            # dummy request (see below). Worst case: static_num_tokens extra pages.
+            fwd_ctx = get_forward_context()
+            pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
+            extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + extra_kv + 256,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
@@ -1483,6 +1485,40 @@ class FlashInferIndicesUpdaterPrefill:
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+
+            # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
+            # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
+            # Append a dummy request for the padding tokens so that
+            # qo_indptr[-1] == static_num_tokens, satisfying flashinfer's shape check
+            # without corrupting the causal masks of real requests.
+            # The dummy request's KV indices all point to slot 0 (a scratch location);
+            # its attention output is discarded via the [:raw_num_tokens] slice in replay.
+            bs_eff = bs
+            # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
+            # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
+            # so this block requires no CPU-GPU synchronisation.
+            actual_qo_tokens = (
+                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
+            )
+            if (
+                pcg_num_tokens is not None
+                and actual_qo_tokens is not None
+                and pcg_num_tokens > actual_qo_tokens
+            ):
+                pad_tokens = pcg_num_tokens - actual_qo_tokens
+                num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
+                kv_start = (
+                    paged_kernel_lens_sum  # equals kv_indptr[-1], no .item() needed
+                )
+                kv_indices[kv_start : kv_start + num_dummy_pages] = 0
+                qo_indptr = torch.cat(
+                    [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
+                )
+                kv_indptr = torch.cat(
+                    [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
+                )
+                bs_eff = bs + 1
+
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
@@ -1494,6 +1530,7 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+            bs_eff = bs
 
         # extend part
         if use_ragged:
@@ -1535,7 +1572,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            self.kv_last_page_len[:bs_eff],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,

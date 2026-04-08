@@ -272,3 +272,5 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+.omc/
+docs/overleaf_project

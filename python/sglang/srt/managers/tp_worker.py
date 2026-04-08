@@ -49,10 +49,12 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +189,17 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
-        tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        if recv_req.load_format == "flattened_bucket":
+            flattened_data = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_tensors
+            )
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=flattened_data["flattened_tensor"],
+                metadata=flattened_data["metadata"],
+            )
+            tensors = dict(bucket.reconstruct_tensors())
+        else:
+            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
@@ -220,6 +232,7 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
@@ -237,6 +250,7 @@ class TpModelWorker(BaseTpWorker):
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.memory_pool_config = memory_pool_config
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
 
@@ -343,6 +357,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -368,6 +383,7 @@ class TpModelWorker(BaseTpWorker):
                     is_draft_worker=self.is_draft_worker,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
                 )
             )
@@ -391,6 +407,9 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def register_hisparse_coordinator(self, coordinator):
+        self.model_runner.hisparse_coordinator = coordinator
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -413,18 +432,9 @@ class TpModelWorker(BaseTpWorker):
     def _forward_batch_generation_dllm(
         self, forward_batch: ForwardBatch, overlap_fn=None,
     ) -> GenerationBatchResult:
-        import time as _time
-        _t0 = _time.perf_counter()
         logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
             self.model_runner, forward_batch, overlap_fn=overlap_fn,
         )
-        _t1 = _time.perf_counter()
-        # Track algorithm.run time for profiling
-        _algo_times = getattr(self, '_dllm_algo_times', None)
-        if _algo_times is None:
-            _algo_times = []
-            self._dllm_algo_times = _algo_times
-        _algo_times.append(_t1 - _t0)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
@@ -459,28 +469,10 @@ class TpModelWorker(BaseTpWorker):
             assert forward_batch is not None
 
         if self.is_dllm():
-            import time as _time
-            _tinit = _time.perf_counter()
-            result = self._forward_batch_generation_dllm(
-                forward_batch, overlap_fn=getattr(model_worker_batch, '_dllm_overlap_fn', None)
+            return self._forward_batch_generation_dllm(
+                forward_batch,
+                overlap_fn=getattr(model_worker_batch, '_dllm_overlap_fn', None),
             )
-            _tdone = _time.perf_counter()
-            # Track init_new + algorithm timing
-            _fwd_times = getattr(self, '_dllm_fwd_profile', None)
-            if _fwd_times is None:
-                _fwd_times = {'init_new': [], 'algo': [], 'count': 0}
-                self._dllm_fwd_profile = _fwd_times
-            algo_time = self._dllm_algo_times[-1] if self._dllm_algo_times else 0
-            init_time = (_tdone - _tinit) - algo_time
-            _fwd_times['init_new'].append(init_time)
-            _fwd_times['algo'].append(algo_time)
-            _fwd_times['count'] += 1
-            if _fwd_times['count'] % 500 == 0:
-                n = min(500, len(_fwd_times['init_new']))
-                avg_init = sum(_fwd_times['init_new'][-n:]) / n * 1e6
-                avg_algo = sum(_fwd_times['algo'][-n:]) / n * 1e6
-                logger.info(f"[DLLM fwd profile] init_new={avg_init:.0f}us algo={avg_algo:.0f}us")
-            return result
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(

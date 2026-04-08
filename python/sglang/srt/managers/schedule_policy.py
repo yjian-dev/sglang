@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -34,9 +35,11 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -381,6 +384,8 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        max_prefill_bs: int = 0,
+        max_running_requests: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
@@ -427,8 +432,11 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
+        self.max_running_requests = max_running_requests
+        self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
+        self.max_prefill_bs = max_prefill_bs
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -563,11 +571,9 @@ class PrefillAdder:
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
+        result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-            req.swa_uuid_for_lock = swa_uuid_for_lock
-        else:
-            self.tree_cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -635,14 +641,15 @@ class PrefillAdder:
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         try:
+            result = self.tree_cache.inc_lock_ref(last_node)
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-            else:
-                self.tree_cache.inc_lock_ref(last_node)
+                swa_uuid_for_lock = result.swa_uuid_for_lock
             yield None
         finally:
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+                self.tree_cache.dec_lock_ref(
+                    last_node, DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+                )
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
@@ -736,10 +743,21 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if (self.prefill_delayer_single_pass is not None) and (
+            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+            )
+        ):
+            return AddReqResult.OTHER
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if self.nsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
+        if (
+            self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
+        ) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -771,7 +789,11 @@ class PrefillAdder:
 
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    InitLoadBackParams(
+                        last_host_node=req.last_host_node,
+                        host_hit_length=req.host_hit_length,
+                        req=req,
+                    )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
@@ -783,18 +805,14 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if (self.prefill_delayer_single_pass is not None) and (
-                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                    local_prefillable=True
-                )
-            ):
-                return AddReqResult.OTHER
-
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                # Ignore truncation_align_size for dllm prefill (block_size alignment is used instead)
+                assert (
+                    truncation_align_size is None
+                ), "truncation_align_size is not supported for dllm prefill"
+
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
