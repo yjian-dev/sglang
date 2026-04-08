@@ -1443,6 +1443,7 @@ class Scheduler(
 
         Overlaps recv_requests with GPU forward to hide scheduling latency.
         """
+        import time as _time
         steps = 0
         exit_reason = "unknown"
         batch = initial_batch
@@ -1450,11 +1451,16 @@ class Scheduler(
         _recv_done = False
         _overlap_recv_reqs = []
         _deferred_stream_batch = None
+        _t_sched = _t_prep = _t_forward = _t_process = 0.0
+        _t_recv = _t_filter = _t_absorb = 0.0
+        _n_absorb = 0
 
         try:
             while True:
+                _ts0 = _time.perf_counter()
                 if not _recv_done:
                     recv_reqs = self.recv_requests()
+                    _t_recv += _time.perf_counter() - _ts0
                     if recv_reqs:
                         self.process_input_requests(recv_reqs)
                 else:
@@ -1464,6 +1470,7 @@ class Scheduler(
                     _overlap_recv_reqs = []
 
                 # Handle finished requests FIRST (batch tensors still consistent)
+                _tf0 = _time.perf_counter()
                 if any(r.finished() for r in batch.reqs):
                     self.dllm_manager.staging_queue = [
                         r for r in self.dllm_manager.staging_queue
@@ -1474,13 +1481,21 @@ class Scheduler(
                     if batch.is_empty():
                         exit_reason = "all_finished"
                         break
+                _t_filter += _time.perf_counter() - _tf0
 
                 # Inline absorb new requests AFTER filter
                 if self.waiting_queue:
+                    _ta0 = _time.perf_counter()
                     self._inline_absorb_new_requests(batch)
+                    _t_absorb += _time.perf_counter() - _ta0
+                    _n_absorb += 1
+
+                _t_sched += _time.perf_counter() - _ts0
 
                 # Lightweight batch prep
+                _tp0 = _time.perf_counter()
                 success = batch.prepare_for_dllm_decode()
+                _t_prep += _time.perf_counter() - _tp0
                 if not success:
                     exit_reason = "alloc_failed"
                     break
@@ -1501,14 +1516,18 @@ class Scheduler(
                     _recv_done = True
 
                 model_worker_batch._dllm_overlap_fn = _overlap_fn
+                _tfwd0 = _time.perf_counter()
                 with self.record_forward_metrics(batch):
                     result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                     )
+                _t_forward += _time.perf_counter() - _tfwd0
                 batch.output_ids = result.next_token_ids
 
                 # Critical-path process: KV free + state update + finished check
+                _tpr0 = _time.perf_counter()
                 self._process_dllm_critical_inline(batch, result)
+                _t_process += _time.perf_counter() - _tpr0
                 _deferred_stream_batch = (list(batch.reqs), batch.return_logprob)
 
                 self.dllm_manager.staging_queue = [
@@ -1542,9 +1561,23 @@ class Scheduler(
                 self.dllm_manager.waiting_queue.append(req)
 
         if steps > 0:
-            logger.info(
-                f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}"
-            )
+            total_t = _t_sched + _t_prep + _t_forward + _t_process
+            if total_t > 0:
+                logger.info(
+                    f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}, "
+                    f"total={total_t*1000:.0f}ms "
+                    f"(sched={_t_sched/total_t*100:.0f}% "
+                    f"[recv={_t_recv*1000:.0f}ms filter={_t_filter*1000:.0f}ms "
+                    f"absorb={_t_absorb*1000:.0f}ms/{_n_absorb}calls] "
+                    f"prep={_t_prep/total_t*100:.0f}% "
+                    f"fwd={_t_forward/total_t*100:.0f}% "
+                    f"proc={_t_process/total_t*100:.0f}%) "
+                    f"step={total_t/steps*1000:.1f}ms"
+                )
+            else:
+                logger.info(
+                    f"[DLLM decode loop] ran {steps} fast steps, exit: {exit_reason}"
+                )
 
     @DynamicGradMode()
     def event_loop_normal(self):

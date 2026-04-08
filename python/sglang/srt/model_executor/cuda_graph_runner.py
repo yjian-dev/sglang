@@ -97,7 +97,12 @@ _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype, shape) tuples.
+
+    torch._foreach_copy_ requires all tensors in a group to have matching shapes.
+    DLLM batches have mixed sizes (e.g., input_ids is block_size*bs while
+    req_pool_indices is bs), so we group by shape as well as dtype.
+    """
 
     def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
         if _has_foreach_copy:
@@ -106,9 +111,9 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             for dst, src in zip(dsts, srcs):
                 dst.copy_(src)
 
-    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
+    groups: Dict[Tuple[torch.dtype, torch.dtype, Tuple[int, ...]], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
-        key = (dst.dtype, src.dtype)
+        key = (dst.dtype, src.dtype, tuple(dst.shape))
         if key not in groups:
             groups[key] = ([], [])
         groups[key][0].append(dst)
@@ -265,6 +270,24 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        # DLLM fast path: skip all ngram/mamba/encoder/pp checks.
+        # DLLM decode loop calls forward many times per step; every ns counts.
+        if raw_num_token != raw_bs:
+            if bs != raw_bs:
+                self.seq_lens.fill_(seq_len_fill_value)
+                self.out_cache_loc.zero_()
+            self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+            self.positions[:raw_num_token].copy_(forward_batch.positions)
+            if forward_batch.seq_lens_cpu is not None:
+                if bs != raw_bs:
+                    self.seq_lens_cpu.fill_(seq_len_fill_value)
+                self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            return
+
+        # Standard path for AR / speculative decode.
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
@@ -663,6 +686,13 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        # DLLM: input_ids.shape[0] must equal batch_size * num_tokens_per_bs.
+        # Prefill/inline-prefill batches have variable token counts and must
+        # skip cuda graph. shape[0] is a Python int (no GPU sync).
+        if self.num_tokens_per_bs > 1 and forward_batch.input_ids is not None:
+            if forward_batch.input_ids.shape[0] != forward_batch.batch_size * self.num_tokens_per_bs:
+                return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
