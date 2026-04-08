@@ -9,6 +9,16 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _get_num_transfer_tokens(block_size: int, steps: int):
+    """Distribute block_size tokens evenly across steps (matches official HF generate)."""
+    base = block_size // steps
+    remainder = block_size % steps
+    schedule = torch.zeros(steps, dtype=torch.int64)
+    schedule[:] = base
+    schedule[:remainder] += 1
+    return schedule
+
+
 class JointThreshold(DllmAlgorithm):
 
     def __init__(
@@ -22,11 +32,21 @@ class JointThreshold(DllmAlgorithm):
             "max_post_edit_steps", 16
         )
         self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
+        # steps: number of denoising steps per block.
+        # Default = block_size → 1 token per step (most conservative, matches HF default).
+        # Smaller steps = faster but potentially lower quality.
+        self.steps = config.algorithm_config.get("steps", self.block_size)
+        # Pre-compute per-step transfer schedule
+        self._transfer_schedule = _get_num_transfer_tokens(self.block_size, self.steps)
+
+    def cleanup_request(self, req_pool_idx: int):
+        pass
 
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
+        overlap_fn=None,
     ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
@@ -48,14 +68,15 @@ class JointThreshold(DllmAlgorithm):
             start_list.append(prompt_mask.sum().item())
 
         post_edit_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        # Track denoising step index per batch item (for scheduled transfer)
+        denoise_step = torch.zeros(batch_size, dtype=torch.int32, device=device)
 
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        # Controls whether to perform an additional forward pass for KV cache persistence.
-        # For certain decoding rounds where the terminal step yields no state change,
-        # this can be set to False to bypass the overhead of an idle forward pass.
         any_changed_in_last_step = False
 
-        max_iterations = self.block_size + self.max_post_edit_steps
+        schedule = self._transfer_schedule.to(device)
+        max_iterations = self.steps + self.max_post_edit_steps
+
         for _ in range(max_iterations):
             if finished.all():
                 break
@@ -92,26 +113,38 @@ class JointThreshold(DllmAlgorithm):
                     -1,
                 )
 
-                mask_index = curr_input_ids == self.mask_id
-                has_mask = mask_index.any()
+                curr_mask_index = curr_input_ids == self.mask_id
+                has_mask = curr_mask_index.any()
 
-                # Mask to token (M2T)
-                mask_transfer_index = torch.zeros_like(mask_index)
+                # Mask to token (M2T) with scheduled transfer
+                mask_transfer_index = torch.zeros_like(curr_mask_index)
                 if has_mask:
-                    confidence = torch.where(mask_index, p, -np.inf)
-                    mask_transfer_index = confidence > self.threshold
+                    step_idx = min(int(denoise_step[i].item()), self.steps - 1)
+                    num_to_transfer = int(schedule[step_idx].item())
+                    num_available = int(curr_mask_index.sum().item())
+                    num_to_transfer = min(num_to_transfer, num_available)
 
-                    if not mask_transfer_index.any():
-                        _, select_index = torch.topk(confidence, k=1)
-                        mask_transfer_index[select_index] = True
+                    confidence = torch.where(curr_mask_index, p, torch.tensor(-float('inf'), device=device))
+                    high_conf = (confidence > self.threshold) & curr_mask_index
+                    num_high = int(high_conf.sum().item())
+
+                    if num_high >= num_to_transfer:
+                        # Enough high-confidence tokens: commit all of them
+                        mask_transfer_index = high_conf
+                    else:
+                        # Not enough: take top-k by confidence
+                        _, idx = torch.topk(confidence, k=num_to_transfer)
+                        mask_transfer_index[idx] = True
+
+                    denoise_step[i] += 1
                 else:
                     post_edit_steps[i] += 1
                     if post_edit_steps[i] > self.max_post_edit_steps:
                         finished[i] = True
                         continue
 
-                # Token to token (T2T)
-                edit_mask = ~mask_index & ~curr_prompt_mask
+                # Token to token (T2T) editing
+                edit_mask = ~curr_mask_index & ~curr_prompt_mask
                 edit_transfer_index = (
                     (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
                 )
@@ -128,10 +161,12 @@ class JointThreshold(DllmAlgorithm):
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
-        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
+        next_token_ids_list = []
+        for i in range(batch_size):
+            block_start = i * self.block_size
+            block_end = block_start + self.block_size
+            block_ids = forward_batch.input_ids[block_start:block_end]
+            next_token_ids_list.append(block_ids[start_list[i]:])
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

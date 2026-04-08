@@ -12,12 +12,17 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        causal_prefill: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        # If True, STAGING_PREFILL uses causal (lower-triangular) attention
+        # instead of bidirectional. Required for SDAR models trained with
+        # use_regular_causal=True where prompt tokens attend causally.
+        self.causal_prefill = causal_prefill
 
     @staticmethod
     def from_server_args(
@@ -45,6 +50,16 @@ class DllmConfig:
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
+        # Prefer block_size from model config if available (e.g. block_size=1
+        # models vs the default block_size=4 in DLLM_PARAMS).
+        hf_block_size = getattr(model_config.hf_config, "block_size", None)
+        if hf_block_size is not None:
+            block_size = hf_block_size
+
+        # SDAR models with use_regular_causal=True were trained with causal
+        # attention for prompt (x0) tokens; prefill must use causal attention.
+        causal_prefill = getattr(model_config.hf_config, "use_regular_causal", False)
+
         max_running_requests = (
             1
             if server_args.max_running_requests is None
@@ -66,10 +81,16 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        # Allow YAML to override causal_prefill (some models have
+        # use_regular_causal=None but still need causal prefill).
+        if algorithm_config.get("causal_prefill") is not None:
+            causal_prefill = algorithm_config["causal_prefill"]
+
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            causal_prefill=causal_prefill,
         )

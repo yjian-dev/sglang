@@ -184,6 +184,11 @@ class SDARAttention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+        # Disable fused rope+KV store for DLLM (dtype mismatch: int32 vs int64)
+        use_fused = (
+            enable_fused_set_kv_buffer(forward_batch)
+            and not forward_batch.forward_mode.is_dllm_extend()
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -194,7 +199,7 @@ class SDARAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if use_fused
                 else None
             ),
         )
@@ -219,6 +224,13 @@ class SDARAttention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+        # Disable fused rope+KV store for DLLM: the fused kernel requires
+        # positions and out_cache_loc to share the same dtype, but DLLM
+        # positions are int32 while out_cache_loc is int64.
+        use_fused = (
+            enable_fused_set_kv_buffer(forward_batch)
+            and not forward_batch.forward_mode.is_dllm_extend()
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -229,7 +241,7 @@ class SDARAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if use_fused
                 else None
             ),
         )
@@ -243,7 +255,7 @@ class SDARAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not use_fused,
         )
         out, _ = self.o_proj(context_layer)
         return out

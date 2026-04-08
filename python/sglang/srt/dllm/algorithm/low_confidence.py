@@ -20,12 +20,17 @@ class LowConfidence(DllmAlgorithm):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
 
+    def cleanup_request(self, req_pool_idx: int):
+        pass
+
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
+        overlap_fn=None,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
         batch_size = forward_batch.batch_size
+        num_forwards = 0
         # Here, the forward_batch full logits contains all the blocks
         # such as [dllm_block_size * batch_size, hidden_size]
         start_list = []
@@ -35,7 +40,8 @@ class LowConfidence(DllmAlgorithm):
         if torch.sum(mask_index).item() == 0:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-
+            num_forwards += 1
+            self._stats["total_forwards"] += num_forwards
             next_token_ids = []
             return logits_output, next_token_ids, can_run_cuda_graph
 
@@ -55,6 +61,7 @@ class LowConfidence(DllmAlgorithm):
 
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            num_forwards += 1
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
             for batch_id in range(batch_size):
                 curr_block_start = batch_id * self.block_size
@@ -89,14 +96,24 @@ class LowConfidence(DllmAlgorithm):
 
                 block_input_ids[transfer_index] = x[transfer_index]
 
+        # Commit forward: update KV cache with final tokens
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        num_forwards += 1
+
         # Here next token ids is tricky to implement the dynamic lengths,
         # so we return a list of tensors
         next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+
+        # Update stats
+        total_new_tokens = sum(
+            self.block_size - start_list[i] for i in range(batch_size)
+        )
+        self._stats["total_forwards"] += num_forwards
+        self._stats["total_tokens"] += total_new_tokens
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

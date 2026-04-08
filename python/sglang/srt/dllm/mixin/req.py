@@ -19,8 +19,17 @@ class DllmReqPhase(str, enum.Enum):
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
+        self.dllm_ids = []
         self.dllm_block_offset = 0
+        self.dllm_denoise_step = 0
+        self.dllm_needs_commit = False
         self.dllm_config = dllm_config
+        # KV trim support: when set, cache_unfinished_req uses this
+        # instead of len(fill_ids) to bound prefix_indices.
+        self.dllm_kv_valid_len: Optional[int] = None
+        # Variable advance: override how much dllm_block_offset advances
+        # in the next _init_fill_ids_for_dllm call (default = block_size).
+        self.dllm_next_advance: Optional[int] = None
 
         if self.dllm_config is not None:
             if len(self.origin_input_ids) < self.dllm_config.block_size:
@@ -42,7 +51,6 @@ class ReqDllmMixin:
         min_required_length = prefix_length + self.dllm_config.block_size
 
         if len(self.fill_ids) < min_required_length:
-            # still incoming stage
             return
 
         input_block = self.fill_ids[prefix_length:min_required_length]
@@ -54,21 +62,20 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
-        self.dllm_block_offset = (
-            0
-            if not self.fill_ids
-            else self.dllm_block_offset + self.dllm_config.block_size
-        )
-        self.fill_ids = (
-            self.origin_input_ids
-            + self.output_ids
-            + [self.dllm_config.mask_id] * self.dllm_config.block_size
-        )
+        if not self.dllm_ids:
+            self.dllm_ids = (
+                self.origin_input_ids
+                + [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
+        else:
+            # Use variable advance if set (for KV trim), else block_size.
+            advance = (
+                self.dllm_next_advance
+                if self.dllm_next_advance is not None
+                else self.dllm_config.block_size
+            )
+            self.dllm_next_advance = None  # reset
+            self.dllm_block_offset += advance
+            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
 
-    def _update_block_offset_for_dllm(self):
-        prefix_len = len(self.prefix_indices)
-        assert (
-            prefix_len % self.dllm_config.block_size == 0
-        ), f"Unexpected prefix len: {prefix_len}"
-        if prefix_len > self.dllm_block_offset:
-            self.dllm_block_offset = prefix_len
+        self.fill_ids = self.dllm_ids
